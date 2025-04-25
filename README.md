@@ -63,7 +63,7 @@ A secure, user-authenticated CLI journal application with per-user encryption, s
 
 ### Clone and Build
 ```sh
-git clone https://github.com/yourusername/journaler.git
+git clone https://github.com/balain/journaler.git
 cd journaler
 cargo build --release
 ```
