@@ -146,6 +146,10 @@ Debug output is hidden by default and only shown when the flag or environment va
 - `JOURNAL_DB`: Set the SQLite DB path (default: `journal.db`)
 - `JOURNALER_SESSION_TIMEOUT`: Set session timeout in seconds (default: 1800)
 
----
+## More Information
 
 For more details, see the built-in guide: `journaler --guide`
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
