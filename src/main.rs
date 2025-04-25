@@ -8,7 +8,7 @@ use dialoguer::{Confirm, Input, Password};
 use rusqlite::Connection;
 use std::fs;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
+use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Serialize, Deserialize};
 use dirs;
 
@@ -76,7 +76,7 @@ struct Cli {
     /// Disable interactive prompts (for automated tests)
     #[arg(long, hide = true, action = ArgAction::SetTrue)]
     no_interactive: bool,
-    #[arg(long, env = "JOURNALER_SESSION_TIMEOUT", default_value_t = 1800)]
+    #[arg(long, default_value_t = 1800)]
     session_timeout: u64,
     #[command(subcommand)]
     command: Option<Commands>,
@@ -272,6 +272,10 @@ fn main() {
         return;
     }
     let no_interactive = cli.no_interactive;
+    let _session_timeout = std::env::var("JOURNALER_SESSION_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(cli.session_timeout);
     match cli.command {
         Some(Commands::RegisterUser) => {
             let conn = Connection::open(db::db_path()).expect("Failed to open DB");
@@ -292,7 +296,7 @@ fn main() {
             let user = require_auth();
             let old_password: String = Password::new().with_prompt("Current password").interact().unwrap();
             let new_password: String = Password::new().with_prompt("New password").with_confirmation("Confirm new password", "Passwords do not match").interact().unwrap();
-            match db::change_password(user, &old_password, &new_password) {
+            match db::change_password(&user, &old_password, &new_password) {
                 Ok(_) => println!("Password changed and all your data re-encrypted."),
                 Err(_) => println!("Password change failed. Did you enter your current password correctly?"),
             }
@@ -310,7 +314,7 @@ fn main() {
         Some(cmd) => match cmd {
             Commands::Add { content, tags, due, status } => {
                 let mut tags_vec = Vec::new();
-                let all_tags = db::list_tags(user).expect("Failed to list tags");
+                let all_tags = db::list_tags(&user).expect("Failed to list tags");
                 for tag in tags {
                     if let Some(existing) = prompt_for_similar_tag(&tag, &all_tags, no_interactive) {
                         tags_vec.push(existing);
@@ -319,18 +323,18 @@ fn main() {
                     }
                 }
                 let tags_vec = if tags_vec.is_empty() { None } else { Some(tags_vec) };
-                db::add_entry(user, &content, tags_vec, due, status).expect("Add failed");
+                db::add_entry(&user, &content, tags_vec, due, status).expect("Add failed");
                 println!("Entry added.");
             }
             Commands::List { tag, status } => {
-                let entries = db::list_entries(user, tag, status).expect("List failed");
+                let entries = db::list_entries(&user, tag, status).expect("List failed");
                 let now = Local::now();
-                for e in entries {
+                for e in &entries {
                     let created_disp = {
                         let created = &e.created_at;
                         if let Ok(ndt) = NaiveDateTime::parse_from_str(created, "%Y-%m-%d %H:%M:%S%.f") {
-                            let dt: DateTime<Local> = Local.from_local_datetime(&ndt).unwrap();
-                            let diff = now.signed_duration_since(dt);
+                            let created_dt = Local.from_local_datetime(&ndt).unwrap();
+                            let diff = now.signed_duration_since(created_dt);
                             if diff.num_minutes() < 120 && diff.num_seconds() >= 0 {
                                 if diff.num_minutes() < 1 {
                                     format!("just now")
@@ -355,27 +359,19 @@ fn main() {
                         }
                     };
                     let last_mod_disp = if let Some(updated) = &e.updated_at {
-                        if let Ok(ndt) = NaiveDateTime::parse_from_str(updated, "%Y-%m-%d %H:%M:%S%.f") {
-                            let dt: DateTime<Local> = Local.from_local_datetime(&ndt).unwrap();
+                        if let Ok(updated) = NaiveDateTime::parse_from_str(updated, "%Y-%m-%d %H:%M:%S%.f") {
+                            let dt: DateTime<Local> = Local.from_local_datetime(&updated).unwrap();
                             let diff = now.signed_duration_since(dt);
                             if diff.num_minutes() < 120 && diff.num_seconds() >= 0 {
                                 if diff.num_minutes() < 1 {
                                     format!("just now")
                                 } else if diff.num_minutes() == 1 {
                                     format!("1 minute ago")
-                                } else if diff.num_minutes() < 60 {
-                                    format!("{} minutes ago", diff.num_minutes())
                                 } else {
-                                    let h = diff.num_minutes() / 60;
-                                    let m = diff.num_minutes() % 60;
-                                    if m == 0 {
-                                        format!("{} hour{} ago", h, if h == 1 { "" } else { "s" })
-                                    } else {
-                                        format!("{} hour{} {} min ago", h, if h == 1 { "" } else { "s" }, m)
-                                    }
+                                    format!("{} minutes ago", diff.num_minutes())
                                 }
                             } else {
-                                updated.clone()
+                                dt.format("%Y-%m-%d %H:%M").to_string()
                             }
                         } else {
                             updated.clone()
@@ -401,10 +397,70 @@ fn main() {
                     }
                     println!("{}", fields.join(" "));
                 }
+                // --- Stats ---
+                let total = entries.len();
+                let mut ages = vec![];
+                let mut last_updates = vec![];
+                let mut user_counts = std::collections::HashMap::new();
+                let mut updates_1h = 0;
+                let mut updates_1d = 0;
+                let mut updates_1w = 0;
+                let mut updates_1m = 0;
+                for e in &entries {
+                    // Age
+                    if let Ok(created) = NaiveDateTime::parse_from_str(&e.created_at, "%Y-%m-%d %H:%M:%S%.f") {
+                        let created_dt = Local.from_local_datetime(&created).unwrap();
+                        let age = now.signed_duration_since(created_dt).num_seconds();
+                        ages.push(age as f64);
+                    }
+                    // Last updated
+                    if let Some(updated_at) = &e.updated_at {
+                        if let Ok(updated) = NaiveDateTime::parse_from_str(updated_at, "%Y-%m-%d %H:%M:%S%.f") {
+                            let updated_dt = Local.from_local_datetime(&updated).unwrap();
+                            let since = now.signed_duration_since(updated_dt).num_seconds();
+                            last_updates.push(since as f64);
+                            if since <= 3600 { updates_1h += 1; }
+                            if since <= 86400 { updates_1d += 1; }
+                            if since <= 604800 { updates_1w += 1; }
+                            if since <= 2592000 { updates_1m += 1; }
+                        }
+                    }
+                    // Per-user counts
+                    *user_counts.entry(e.user_id).or_insert(0) += 1;
+                }
+                let avg_age = if !ages.is_empty() { ages.iter().sum::<f64>() / ages.len() as f64 / 3600.0 / 24.0 } else { 0.0 };
+                let avg_last_update = if !last_updates.is_empty() { last_updates.iter().sum::<f64>() / last_updates.len() as f64 / 3600.0 / 24.0 } else { 0.0 };
+                println!("\n--- Stats ---");
+                println!("Total entries: {}", total);
+                println!("Average age of entries: {:.2} days", avg_age);
+                println!("Average time since last update: {:.2} days", avg_last_update);
+                println!("Number of unique users: {}", user_counts.len());
+                // Map user_id to username for entries per user stats
+                let mut user_names = std::collections::HashMap::new();
+                {
+                    let conn = Connection::open(db::db_path()).expect("Failed to open DB");
+                    let mut stmt = conn.prepare("SELECT id, username FROM users").expect("Failed to prepare");
+                    let mut rows = stmt.query([]).expect("Failed to query");
+                    while let Some(row) = rows.next().expect("Failed to get row") {
+                        let uid: i64 = row.get(0).expect("Failed to get id");
+                        let uname: String = row.get(1).expect("Failed to get username");
+                        user_names.insert(uid, uname);
+                    }
+                }
+                println!("Entries per user:");
+                for (uid, count) in &user_counts {
+                    let uname = user_names.get(uid).map(|s| s.as_str()).unwrap_or("(unknown)");
+                    println!("  {}: {}", uname, count);
+                }
+                println!("Entry updates in last:");
+                println!("  1 hour: {}", updates_1h);
+                println!("  1 day: {}", updates_1d);
+                println!("  1 week: {}", updates_1w);
+                println!("  1 month: {}", updates_1m);
             }
             Commands::Update { id, content, tags, remove_tag, due, status } => {
                 let mut tags_vec = Vec::new();
-                let all_tags = db::list_tags(user).expect("Failed to list tags");
+                let all_tags = db::list_tags(&user).expect("Failed to list tags");
                 for tag in tags {
                     if let Some(existing) = prompt_for_similar_tag(&tag, &all_tags, no_interactive) {
                         tags_vec.push(existing);
@@ -414,18 +470,18 @@ fn main() {
                 }
                 let tags_vec = if tags_vec.is_empty() { None } else { Some(tags_vec) };
                 let remove_tags_vec = if remove_tag.is_empty() { None } else { Some(remove_tag.clone()) };
-                db::update_entry(user, id, content, tags_vec, remove_tags_vec, due, status).expect("Update failed");
+                db::update_entry(&user, id, content, tags_vec, remove_tags_vec, due, status).expect("Update failed");
                 println!("Entry updated.");
             }
             Commands::View { id } => {
-                if let Some(e) = db::get_entry(user, id).expect("View failed") {
+                if let Some(e) = db::get_entry(&user, id).expect("View failed") {
                     println!("{}: {} [tags: {}] [due: {:?}] [status: {}] [created: {}] [updated: {:?}]", e.id, e.content, e.tags.join(", "), e.due_date, e.status, e.created_at, e.updated_at);
                 } else {
                     println!("Entry not found.");
                 }
             }
             Commands::Tags => {
-                let tags = db::list_tags_with_counts(user).expect("Failed to list tags");
+                let tags = db::list_tags_with_counts(&user).expect("Failed to list tags");
                 if tags.is_empty() {
                     println!("No tags found.");
                 } else {
@@ -436,7 +492,7 @@ fn main() {
                 }
             }
             Commands::Search { query } => {
-                let results = db::search_entries(user, &query).expect("Search failed");
+                let results = db::search_entries(&user, &query).expect("Search failed");
                 if results.is_empty() {
                     println!("No entries found matching '{}'.", query);
                 } else {
@@ -449,7 +505,7 @@ fn main() {
                 }
             }
             Commands::Export { format, output } => {
-                let entries = db::list_entries(user, None, None).expect("Export failed");
+                let entries = db::list_entries(&user, None, None).expect("Export failed");
                 let fmt = format.to_lowercase();
                 let data = match fmt.as_str() {
                     "csv" => {
@@ -512,7 +568,7 @@ fn main() {
                 }
             }
             Commands::Delete { id } => {
-                let entry = db::get_entry(user, id).expect("Failed to get entry");
+                let entry = db::get_entry(&user, id).expect("Failed to get entry");
                 if entry.is_none() {
                     println!("Entry not found.");
                     return;
@@ -520,14 +576,14 @@ fn main() {
                 let entry = entry.unwrap();
                 println!("You are about to delete entry #{}: {}", entry.id, entry.content);
                 if cli.no_interactive || Confirm::new().with_prompt("Are you sure you want to delete this entry? It will be moved to the recycle bin for 30 days.").default(false).interact().unwrap() {
-                    db::delete_entry(user, id).expect("Delete failed");
+                    db::delete_entry(&user, id).expect("Delete failed");
                     println!("Entry {} moved to recycle bin.", id);
                 } else {
                     println!("Aborted. Entry not deleted.");
                 }
             }
             Commands::RecycleBin => {
-                let entries = db::list_recycle_bin(user).expect("Failed to list recycle bin");
+                let entries = db::list_recycle_bin(&user).expect("Failed to list recycle bin");
                 if entries.is_empty() {
                     println!("Recycle bin is empty.");
                 } else {
@@ -538,16 +594,16 @@ fn main() {
                 }
             }
             Commands::Recover { id } => {
-                let entries = db::list_recycle_bin(user).expect("Failed to list recycle bin");
+                let entries = db::list_recycle_bin(&user).expect("Failed to list recycle bin");
                 if !entries.iter().any(|e| e.id == id) {
                     println!("Entry not found in recycle bin.");
                     return;
                 }
-                db::recover_from_recycle_bin(user, id).expect("Recover failed");
+                db::recover_from_recycle_bin(&user, id).expect("Recover failed");
                 println!("Entry {} recovered from recycle bin.", id);
             }
             Commands::PurgeRecycleBin => {
-                db::purge_expired_recycle_bin(user).expect("Purge failed");
+                db::purge_expired_recycle_bin(&user).expect("Purge failed");
                 println!("Expired entries purged from recycle bin.");
             }
             _ => {}

@@ -1,7 +1,7 @@
 use rusqlite::{params, Connection, Result, ToSql};
 use chrono::Local;
 use std::env;
-use argon2::{Argon2, PasswordHasher, PasswordVerifier, password_hash::{SaltString, PasswordHash, PasswordHasher as _, PasswordVerifier as _}};
+use argon2::{Argon2, password_hash::{SaltString, PasswordHash, PasswordHasher as _, PasswordVerifier as _}};
 use rand::{RngCore, rngs::OsRng};
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 use aes_gcm::aead::{Aead};
@@ -28,6 +28,7 @@ pub struct SearchResult {
     pub updated_at: Option<String>,
 }
 
+#[allow(dead_code)]
 pub struct RecycleBinEntry {
     pub id: i64,
     pub content: String,
@@ -107,13 +108,13 @@ pub fn register_user(conn: &Connection, username: &str, password: &str) -> Resul
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = Argon2::default();
     let hash = argon2.hash_password(password.as_bytes(), &salt).unwrap().to_string();
-    let salt_b64 = salt.as_str();
+    let _salt_b64 = salt.as_str();
     conn.execute(
         "INSERT INTO users (username, password_hash, salt) VALUES (?1, ?2, ?3)",
-        params![username, hash, salt_b64],
+        params![username, hash, _salt_b64],
     )?;
     let id = conn.last_insert_rowid();
-    let key = derive_key(password, salt_b64);
+    let key = derive_key(password, _salt_b64);
     Ok(AuthenticatedUser { id, username: username.to_string(), key })
 }
 
@@ -124,18 +125,18 @@ pub fn login_user(conn: &Connection, username: &str, password: &str) -> Result<O
     if let Some(row) = rows.next()? {
         let id: i64 = row.get(0)?;
         let hash: String = row.get(1)?;
-        let salt_b64: String = row.get(2)?;
+        let _salt_b64: String = row.get(2)?;
         let parsed_hash = PasswordHash::new(&hash).unwrap();
         if Argon2::default().verify_password(password.as_bytes(), &parsed_hash).is_ok() {
-            let key = derive_key(password, &salt_b64);
+            let key = derive_key(password, &_salt_b64);
             return Ok(Some(AuthenticatedUser { id, username: username.to_string(), key }));
         }
     }
     Ok(None)
 }
 
-fn derive_key(password: &str, salt_b64: &str) -> [u8; 32] {
-    let salt = SaltString::from_b64(salt_b64).unwrap();
+fn derive_key(password: &str, _salt_b64: &str) -> [u8; 32] {
+    let salt = SaltString::from_b64(_salt_b64).unwrap();
     let mut key = [0u8; 32];
     Argon2::default()
         .hash_password_into(password.as_bytes(), salt.as_ref().as_bytes(), &mut key)
@@ -489,7 +490,7 @@ pub fn change_password(user: &AuthenticatedUser, old_password: &str, new_passwor
     // Verify old password
     let mut stmt = conn.prepare("SELECT password_hash, salt FROM users WHERE id = ?1")?;
     let mut rows = stmt.query(params![user.id])?;
-    let (hash, salt_b64): (String, String) = if let Some(row) = rows.next()? {
+    let (hash, _salt_b64): (String, String) = if let Some(row) = rows.next()? {
         (row.get(0)?, row.get(1)?)
     } else {
         return Err(rusqlite::Error::InvalidQuery);
