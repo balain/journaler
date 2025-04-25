@@ -196,22 +196,48 @@ USAGE:
 
 COMMANDS:
     add         Add a new journal entry
+                --content <STRING>      Entry content (required)
+                --tags <TAG>...         Tags (zero or more, can repeat)
+                --due <DATE>            Due date (optional)
+                --status <STATUS>       Status (optional)
     update      Update an existing entry
+                --id <ID>               Entry ID (required)
+                --content <STRING>      New content (optional)
+                --tags <TAG>...         Tags to add (zero or more)
+                --remove-tag <TAG>...   Tags to remove (zero or more)
+                --due <DATE>            Due date (optional)
+                --status <STATUS>       Status (optional)
     delete      Delete an entry (moves to recycle bin)
+                --id <ID>               Entry ID (required)
     list        List all entries
+                --tag <TAG>             Filter by tag (optional)
+                --status <STATUS>       Filter by status (optional)
+    view        View a specific entry
+                --id <ID>               Entry ID (required)
+    tags        List all tags
     search      Search entries
-    tags        List tags
-    recycle     Show recycle bin
+                --query <STRING>        Search query (required)
+    recycle     Show recycle bin entries
+    recover     Recover an entry from the recycle bin
+                --id <ID>               Entry ID (required)
     purge       Permanently delete expired recycle bin entries
-    export      Export entries to CSV/Markdown/TXT
-    clean-legacy Remove legacy data (admin)
-    admin-reset  Reset user data (admin)
-    help        Show this help message
+    export      Export entries
+                --format <csv|md|txt>   Export format (required)
+                --output <FILE>         Output file (optional)
+    register-user   Register a new user
+    clean-legacy    Remove legacy data
+    change-password Change your password
+    logout         Log out and clear your session
+    audit-log      View the audit log
+    admin-reset    Admin: Reset a user's password (deletes all their data)
+                --username <USERNAME>   Username to reset (required)
+                --new-password <PW>     New password (required)
 
 OPTIONS:
-    -d, --debug     Enable debug output
+    -d, --debug           Enable debug output
     -n, --no-interactive  Disable interactive prompts (for scripting)
-    -h, --help      Show this help message
+    -h, --help            Show this help message
+    --guide               Show this user guide
 
 NOTES:
     - Entries are encrypted and stored locally in SQLite.
