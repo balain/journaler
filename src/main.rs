@@ -3,7 +3,8 @@
 #![warn(clippy::pedantic)]
 #![warn(clippy::style)]
 #![warn(clippy::explicit_into_iter_loop, clippy::large_stack_arrays, clippy::string_add, clippy::todo)]
-
+#![allow(clippy::format_push_string)]
+#![allow(clippy::too_many_lines)]
 // main.rs - Main CLI logic for Journaler
 // Handles user interaction, command parsing, session management, and output formatting.
 // - Defines CLI commands (add, update, delete, list, tags, recycle bin, audit log, admin reset, etc.)
@@ -22,6 +23,7 @@ use dialoguer::{Confirm, Input, Password};
 use rusqlite::Connection;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Serialize, Deserialize};
 // use dirs;
@@ -98,17 +100,14 @@ fn require_auth() -> db::AuthenticatedUser {
     let username_env = std::env::var("JOURNALER_USERNAME").ok();
     let password_env = std::env::var("JOURNALER_PASSWORD").ok();
     if let (Some(username), Some(password)) = (username_env, password_env) {
-        match db::login_user(&conn, &username, &password) {
-            Ok(Some(user)) => {
-                debug_println!("Authenticated user: id={}, username={}", user.id, user.username);
-                save_session(&user);
-                return user;
-            },
-            _ => {
-                println!("Invalid username or password from env vars.");
-                std::process::exit(1);
-            }
+        if let Ok(Some(user)) = db::login_user(&conn, &username, &password) {
+            debug_println!("Authenticated user: id={}, username={}", user.id, user.username);
+            save_session(&user);
+            return user;
         }
+        println!("Invalid username or password from env vars.");
+        std::process::exit(1);
+
     }
     // Check if any users exist
     if !db::users_exist(&conn).expect("Failed to check users existence") {
@@ -133,7 +132,7 @@ fn require_auth() -> db::AuthenticatedUser {
             std::process::exit(1);
         }
         Err(e) => {
-            println!("Failed to authenticate: {}", e);
+            println!("Failed to authenticate: {e}");
             std::process::exit(1);
         }
     }
@@ -142,9 +141,9 @@ fn require_auth() -> db::AuthenticatedUser {
 /// Formats a status string with color.
 fn color_status(status: &str) -> String {
     match status.to_lowercase().as_str() {
-        "in progress" => format!("\x1b[32m{}\x1b[0m", status), // green
-        "done" => format!("\x1b[34m{}\x1b[0m", status),       // blue
-        "late" => format!("\x1b[31m{}\x1b[0m", status),       // red
+        "in progress" => format!("\x1b[32m{status}\x1b[0m"), // green
+        "done" => format!("\x1b[34m{status}\x1b[0m"),       // blue
+        "late" => format!("\x1b[31m{status}\x1b[0m"),       // red
         _ => status.to_string(),
     }
 }
@@ -167,13 +166,13 @@ fn prompt_for_similar_tag(new_tag: &str, existing_tags: &[String], no_interactiv
         return None;
     }
     println!("A similar tag already exists:");
-    println!("  [0] Add '{}' as a new tag", new_tag);
+    println!("  [0] Add '{new_tag}' as a new tag");
     for (i, t) in matches.iter().enumerate() {
         println!("  [{}] {}", i + 1, t);
     }
-    let prompt = format!("Enter the number of the tag to use for '{}': ", new_tag);
+    let prompt = format!("Enter the number of the tag to use for '{new_tag}': ");
     loop {
-        print!("{}", prompt);
+        print!("{prompt}");
         io::stdout().flush().unwrap();
         let mut input = String::new();
         if io::stdin().read_line(&mut input).is_ok() {
@@ -217,11 +216,12 @@ OPTIONS:
 NOTES:
     - Entries are encrypted and stored locally in SQLite.
     - Use 'clean-legacy' to remove all data not owned by a user.
-")
+");
 }
 
 /// Entry point: parses CLI args, manages session, and dispatches commands.
 fn main() {
+    static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
     db::init().expect("Failed to initialize database");
     let cli = Cli::parse();
     if cli.guide {
@@ -233,8 +233,6 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(cli.session_timeout);
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
     DEBUG_ENABLED.store(cli.debug, Ordering::Relaxed);
     match cli.command {
         Some(Commands::RegisterUser) => {
@@ -242,8 +240,8 @@ fn main() {
             let username: String = Input::new().with_prompt("Username").interact_text().unwrap();
             let password: String = Password::new().with_prompt("Password").with_confirmation("Confirm password", "Passwords do not match").interact().unwrap();
             match db::register_user(&conn, &username, &password) {
-                Ok(_) => println!("User '{username}' registered successfully.", username = username),
-                Err(e) => println!("Failed to register user: {e}", e = e),
+                Ok(_) => println!("User '{username}' registered successfully."),
+                Err(e) => println!("Failed to register user: {e}"),
             }
             return;
         }
@@ -273,13 +271,13 @@ fn main() {
             return;
         }
         Some(Commands::AdminReset { username, new_password }) => {
-            if !Confirm::new().with_prompt(format!("This will delete ALL data for user '{username}'. Continue?", username = username)).default(false).interact().unwrap() {
+            if !Confirm::new().with_prompt(format!("This will delete ALL data for user '{username}'. Continue?")).default(false).interact().unwrap() {
                 println!("Aborted.");
                 return;
             }
             match db::admin_reset_user(&username, &new_password) {
-                Ok(()) => println!("User '{username}' reset. All previous data deleted.", username = username),
-                Err(e) => println!("Admin reset failed: {e}", e = e),
+                Ok(()) => println!("User '{username}' reset. All previous data deleted."),
+                Err(e) => println!("Admin reset failed: {e}"),
             }
             return;
         }
@@ -299,7 +297,7 @@ fn main() {
                     }
                 }
                 let tags_vec = if tags_vec.is_empty() { None } else { Some(tags_vec) };
-                db::add_entry(&user, &content, tags_vec, due, status).expect("Add failed");
+                db::add_entry(&user, &content, tags_vec, due.as_ref(), status.as_ref()).expect("Add failed");
                 db::log_action(&user, "add_entry", Some(&content)).ok();
                 println!("Entry added.");
             }
@@ -347,12 +345,12 @@ fn main() {
                     || e.tags.iter().any(|t| t.to_lowercase().contains(&q))
                 ).collect();
                 if filtered.is_empty() {
-                    println!("No entries found matching '{query}'.", query = query);
+                    println!("No entries found matching '{query}'.");
                 } else {
                     for e in filtered {
-                        let tag_str = if !e.tags.is_empty() {
+                        let tag_str = if e.tags.is_empty() { String::new() } else {
                             format!("[tags: {}] ", e.tags.join(", "))
-                        } else { String::new() };
+                        };
                         let due_str = e.due_date.as_ref().map(|d| format!("[due: {d}]")).unwrap_or_default();
                         let status_str = format!("[status: {}] ", color_status(&e.status));
                         let created_str = format!("[created: {}]", e.created_at);
@@ -406,7 +404,7 @@ fn main() {
                             s.push_str(&format!("#{} | {} | [{}] | Due: {} | Status: {} | Created: {} | Updated: {}\n{}\n\n",
                                 e.id,
                                 e.content,
-                                if e.tags.is_empty() { "".to_string() } else { e.tags.join(", ") },
+                                if e.tags.is_empty() { String::new() } else { e.tags.join(", ") },
                                 e.due_date.as_deref().unwrap_or("-"),
                                 e.status,
                                 e.created_at,
@@ -417,15 +415,15 @@ fn main() {
                         s
                     },
                     _ => {
-                        eprintln!("Unknown export format: {format}. Use csv, md, or txt.", format = format);
+                        eprintln!("Unknown export format: {format}. Use csv, md, or txt.");
                         return;
                     }
                 };
                 if let Some(path) = output {
                     std::fs::write(&path, data).expect("Failed to write export file");
-                    println!("Exported to {path}", path = path);
+                    println!("Exported to {path}");
                 } else {
-                    println!("{}", data);
+                    println!("{data}");
                 }
             }
             Commands::Delete { id } => {
@@ -438,8 +436,8 @@ fn main() {
                 println!("You are about to delete entry #{}: {}", entry.id, entry.content);
                 if cli.no_interactive || Confirm::new().with_prompt("Are you sure you want to delete this entry? It will be moved to the recycle bin for 30 days.").default(false).interact().unwrap() {
                     db::delete_entry(&user, id).expect("Delete failed");
-                    db::log_action(&user, "delete_entry", Some(&format!("id={}", id))).ok();
-                    println!("Entry {id} moved to recycle bin.", id = id);
+                    db::log_action(&user, "delete_entry", Some(&format!("id={id}"))).ok();
+                    println!("Entry {id} moved to recycle bin.");
                 } else {
                     println!("Aborted. Entry not deleted.");
                 }
@@ -462,8 +460,8 @@ fn main() {
                     return;
                 }
                 db::recover_from_recycle_bin(&user, id).expect("Recover failed");
-                db::log_action(&user, "recover_entry", Some(&format!("id={}", id))).ok();
-                println!("Entry {id} recovered from recycle bin.", id = id);
+                db::log_action(&user, "recover_entry", Some(&format!("id={id}"))).ok();
+                println!("Entry {id} recovered from recycle bin.");
             }
             Commands::PurgeRecycleBin => {
                 db::purge_expired_recycle_bin(&user).expect("Purge failed");
@@ -509,7 +507,6 @@ fn main() {
                     Ok(()) => println!("User '{username}' reset. All previous data deleted."),
                     Err(e) => println!("Admin reset failed: {e}"),
                 }
-                return;
             }
             _ => {}
         },

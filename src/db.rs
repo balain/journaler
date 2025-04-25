@@ -35,7 +35,7 @@ pub struct Entry {
     pub user_id: i64,
 }
 
-/// SearchResult struct for search query results.
+/// `SearchResult` struct for search query results.
 #[allow(dead_code)]
 pub struct SearchResult {
     /// Unique entry ID.
@@ -54,7 +54,7 @@ pub struct SearchResult {
     pub updated_at: Option<String>,
 }
 
-/// AuthenticatedUser contains user id, username, and encryption key for session.
+/// `AuthenticatedUser` contains user id, username, and encryption key for session.
 #[allow(dead_code)]
 pub struct AuthenticatedUser {
     /// Unique user ID.
@@ -65,7 +65,7 @@ pub struct AuthenticatedUser {
     pub key: [u8; 32],
 }
 
-/// AuditLog struct represents an audit log entry (action, details, timestamp).
+/// `AuditLog` struct represents an audit log entry (action, details, timestamp).
 #[allow(dead_code)]
 pub struct AuditLog {
     /// Unique audit log entry ID.
@@ -80,7 +80,7 @@ pub struct AuditLog {
     pub timestamp: String,
 }
 
-/// RecycleBinEntry struct represents an entry in the recycle bin.
+/// `RecycleBinEntry` struct represents an entry in the recycle bin.
 #[allow(dead_code)]
 pub struct RecycleBinEntry {
     /// Unique entry ID.
@@ -103,7 +103,7 @@ pub struct RecycleBinEntry {
     pub user_id: i64,
 }
 
-/// Returns the path to the SQLite DB file (from env or default).
+/// Returns the path to the `SQLite` DB file (from env or default).
 pub fn db_path() -> String {
     env::var("JOURNAL_DB").unwrap_or_else(|_| "journal.db".to_string())
 }
@@ -144,7 +144,7 @@ pub fn init() -> Result<()> {
     )?;
     create_users_table(&conn)?;
     migrate_recycle_bin(&conn)?;
-    migrate_all(&conn)?;
+    migrate_all(&conn);
     init_audit_log(&conn)?;
     Ok(())
 }
@@ -169,13 +169,13 @@ pub fn register_user(conn: &Connection, username: &str, password: &str) -> Resul
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = Argon2::default();
     let hash = argon2.hash_password(password.as_bytes(), &salt).unwrap().to_string();
-    let _salt_b64 = salt.as_str();
+    let salt_b64 = salt.as_str();
     conn.execute(
         "INSERT INTO users (username, password_hash, salt) VALUES (?1, ?2, ?3)",
-        params![username, hash, _salt_b64],
+        params![username, hash, salt_b64],
     )?;
     let id = conn.last_insert_rowid();
-    let key = derive_key(password, _salt_b64);
+    let key = derive_key(password, salt_b64);
     Ok(AuthenticatedUser { id, username: username.to_string(), key })
 }
 
@@ -187,10 +187,10 @@ pub fn login_user(conn: &Connection, username: &str, password: &str) -> Result<O
     if let Some(row) = rows.next()? {
         let id: i64 = row.get(0)?;
         let hash: String = row.get(1)?;
-        let _salt_b64: String = row.get(2)?;
+        let salt_b64: String = row.get(2)?;
         let parsed_hash = PasswordHash::new(&hash).unwrap();
         if Argon2::default().verify_password(password.as_bytes(), &parsed_hash).is_ok() {
-            let key = derive_key(password, &_salt_b64);
+            let key = derive_key(password, &salt_b64);
             return Ok(Some(AuthenticatedUser { id, username: username.to_string(), key }));
         }
     }
@@ -198,8 +198,8 @@ pub fn login_user(conn: &Connection, username: &str, password: &str) -> Result<O
 }
 
 /// Derives the encryption key for a user from their password and salt.
-fn derive_key(password: &str, _salt_b64: &str) -> [u8; 32] {
-    let salt = SaltString::from_b64(_salt_b64).unwrap();
+fn derive_key(password: &str, salt_b64: &str) -> [u8; 32] {
+    let salt = SaltString::from_b64(salt_b64).unwrap();
     let mut key = [0u8; 32];
     Argon2::default()
         .hash_password_into(password.as_bytes(), salt.as_ref().as_bytes(), &mut key)
@@ -208,9 +208,9 @@ fn derive_key(password: &str, _salt_b64: &str) -> [u8; 32] {
 }
 
 /// Adds a new journal entry for a user, with optional tags, due date, and status.
-pub fn add_entry(user: &AuthenticatedUser, content: &str, tags: Option<Vec<String>>, due: Option<String>, status: Option<String>) -> Result<()> {
+pub fn add_entry(user: &AuthenticatedUser, content: &str, tags: Option<Vec<String>>, due: Option<&String>, status: Option<&String>) -> Result<()> {
     let conn = Connection::open(db_path())?;
-    migrate_all(&conn)?;
+    migrate_all(&conn);
     let now = Local::now().naive_local().to_string();
     let enc_content = encrypt_field(&user.key, content);
     let enc_due = due.as_ref().map(|d| encrypt_field(&user.key, d));
@@ -249,14 +249,14 @@ fn get_or_create_tag(conn: &Connection, tag: &str) -> Result<i64> {
 /// Lists all journal entries for a user, optionally filtering by tag/status.
 pub fn list_entries(user: &AuthenticatedUser, tag: Option<String>, status: Option<String>) -> Result<Vec<Entry>> {
     let conn = Connection::open(db_path())?;
-    migrate_all(&conn)?;
+    migrate_all(&conn);
     let mut query = "SELECT j.id, j.content, j.due_date, j.status, j.created_at, j.updated_at, j.user_id FROM journal j".to_string();
     let mut wheres = Vec::new();
     let mut params: Vec<Box<dyn ToSql>> = Vec::new();
     if tag.is_some() {
         query.push_str(" JOIN entry_tags et ON j.id = et.entry_id JOIN tags t ON et.tag_id = t.id");
         wheres.push("t.name = ?");
-        params.push(Box::new(tag.unwrap()));
+        params.push(Box::new(tag));
     }
     if status.is_some() {
         wheres.push("j.status = ?");
@@ -306,7 +306,7 @@ fn list_tags_for_entry(conn: &Connection, user: &AuthenticatedUser, entry_id: i6
 /// Updates an existing journal entry for a user.
 pub fn update_entry(user: &AuthenticatedUser, id: i64, content: Option<String>, tags: Option<Vec<String>>, remove_tags: Option<Vec<String>>, due: Option<String>, status: Option<String>) -> Result<()> {
     let conn = Connection::open(db_path())?;
-    migrate_all(&conn)?;
+    migrate_all(&conn);
     let now = Local::now().naive_local().to_string();
     let mut set = Vec::new();
     let mut params: Vec<Box<dyn ToSql>> = Vec::new();
@@ -357,14 +357,14 @@ pub fn update_entry(user: &AuthenticatedUser, id: i64, content: Option<String>, 
             }
         }
     }
-    log_action(user, "Updated entry", Some(&format!("ID: {}", id)))?;
+    log_action(user, "Updated entry", Some(&format!("ID: {id}")))?;
     Ok(())
 }
 
 /// Gets a single journal entry by ID for a user.
 pub fn get_entry(user: &AuthenticatedUser, id: i64) -> Result<Option<Entry>> {
     let conn = Connection::open(db_path())?;
-    migrate_all(&conn)?;
+    migrate_all(&conn);
     let mut stmt = conn.prepare("SELECT id, content, due_date, status, created_at, updated_at, user_id FROM journal WHERE id = ?1 AND user_id = ?2")?;
     let mut rows = stmt.query(params![id, user.id])?;
     if let Some(row) = rows.next()? {
@@ -421,18 +421,17 @@ pub fn migrate_recycle_bin(conn: &Connection) -> Result<()> {
 }
 
 /// Migrates all tables to the latest schema.
-pub fn migrate_all(conn: &Connection) -> Result<()> {
+pub fn migrate_all(conn: &Connection) {
     conn.execute("ALTER TABLE journal ADD COLUMN user_id INTEGER", []).ok();
     conn.execute("ALTER TABLE recycle_bin ADD COLUMN user_id INTEGER", []).ok();
     conn.execute("ALTER TABLE entry_tags ADD COLUMN user_id INTEGER", []).ok();
     conn.execute("ALTER TABLE recycle_bin_tags ADD COLUMN user_id INTEGER", []).ok();
-    Ok(())
 }
 
 /// Moves an entry to the recycle bin.
 pub fn move_to_recycle_bin(user: &AuthenticatedUser, id: i64) -> Result<()> {
     let conn = Connection::open(db_path())?;
-    migrate_all(&conn)?;
+    migrate_all(&conn);
     migrate_recycle_bin(&conn)?;
     let mut entry_stmt = conn.prepare("SELECT id, content, due_date, status, created_at, updated_at FROM journal WHERE id = ?1 AND user_id = ?2")?;
     let mut rows = entry_stmt.query(params![id, user.id])?;
@@ -464,14 +463,14 @@ pub fn move_to_recycle_bin(user: &AuthenticatedUser, id: i64) -> Result<()> {
         conn.execute("DELETE FROM entry_tags WHERE entry_id = ?1 AND user_id = ?2", params![id, user.id])?;
         conn.execute("DELETE FROM journal WHERE id = ?1 AND user_id = ?2", params![id, user.id])?;
     }
-    log_action(user, "Moved entry to recycle bin", Some(&format!("ID: {}", id)))?;
+    log_action(user, "Moved entry to recycle bin", Some(&format!("ID: {id}")))?;
     Ok(())
 }
 
 /// Recovers an entry from the recycle bin.
 pub fn recover_from_recycle_bin(user: &AuthenticatedUser, id: i64) -> Result<()> {
     let conn = Connection::open(db_path())?;
-    migrate_all(&conn)?;
+    migrate_all(&conn);
     migrate_recycle_bin(&conn)?;
     let mut entry_stmt = conn.prepare("SELECT content, due_date, status, created_at, updated_at FROM recycle_bin WHERE id = ?1 AND user_id = ?2")?;
     let mut rows = entry_stmt.query(params![id, user.id])?;
@@ -502,14 +501,14 @@ pub fn recover_from_recycle_bin(user: &AuthenticatedUser, id: i64) -> Result<()>
         conn.execute("DELETE FROM recycle_bin_tags WHERE entry_id = ?1 AND user_id = ?2", params![id, user.id])?;
         conn.execute("DELETE FROM recycle_bin WHERE id = ?1 AND user_id = ?2", params![id, user.id])?;
     }
-    log_action(user, "Recovered entry from recycle bin", Some(&format!("ID: {}", id)))?;
+    log_action(user, "Recovered entry from recycle bin", Some(&format!("ID: {id}")))?;
     Ok(())
 }
 
 /// Purges expired entries from the recycle bin.
 pub fn purge_expired_recycle_bin(user: &AuthenticatedUser) -> Result<()> {
     let conn = Connection::open(db_path())?;
-    migrate_all(&conn)?;
+    migrate_all(&conn);
     migrate_recycle_bin(&conn)?;
     let thirty_days_ago = chrono::Local::now().naive_local() - chrono::Duration::days(30);
     let cutoff = thirty_days_ago.to_string();
@@ -529,7 +528,7 @@ pub fn purge_expired_recycle_bin(user: &AuthenticatedUser) -> Result<()> {
 /// Lists all entries in the recycle bin for a user.
 pub fn list_recycle_bin(user: &AuthenticatedUser) -> Result<Vec<RecycleBinEntry>> {
     let conn = Connection::open(db_path())?;
-    migrate_all(&conn)?;
+    migrate_all(&conn);
     migrate_recycle_bin(&conn)?;
     let mut stmt = conn.prepare(
         "SELECT id, content, due_date, status, created_at, updated_at, deleted_at FROM recycle_bin WHERE user_id = ?1 ORDER BY deleted_at DESC"
@@ -679,7 +678,7 @@ pub fn init_audit_log(conn: &Connection) -> Result<()> {
 /// Logs an action to the audit log for a user.
 pub fn log_action(user: &AuthenticatedUser, action: &str, details: Option<&str>) -> Result<()> {
     let conn = Connection::open(db_path())?;
-    migrate_all(&conn)?;
+    migrate_all(&conn);
     init_audit_log(&conn)?;
     let now = chrono::Local::now().naive_local().to_string();
     // Encrypt details field if present
@@ -695,7 +694,7 @@ pub fn log_action(user: &AuthenticatedUser, action: &str, details: Option<&str>)
 /// Lists all audit log entries for a user.
 pub fn list_audit_log(user: &AuthenticatedUser) -> Result<Vec<AuditLog>> {
     let conn = Connection::open(db_path())?;
-    migrate_all(&conn)?;
+    migrate_all(&conn);
     init_audit_log(&conn)?;
     let mut stmt = conn.prepare("SELECT id, user_id, action, details, timestamp FROM audit_log WHERE user_id = ?1 ORDER BY timestamp DESC")?;
     let log_iter = stmt.query_map(params![user.id], |row| {
