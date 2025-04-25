@@ -80,7 +80,7 @@ fn run_journaler(args: &[&str]) -> String {
     let config_dir = std::env::current_dir().unwrap();
     let output = Command::new("target/debug/journaler")
         .args(&all_args)
-        .env("JOURNAL_DB", "./test_journal.db")
+        .env("JOURNAL_DB", db_path.to_str().unwrap())
         .env("JOURNALER_USERNAME", "testuser")
         .env("JOURNALER_PASSWORD", "testpass")
         .env("XDG_CONFIG_HOME", config_dir.to_str().unwrap())
