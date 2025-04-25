@@ -785,45 +785,6 @@ pub fn list_tags_with_counts(user: &AuthenticatedUser) -> Result<Vec<(String, u3
     Ok(tag_map.into_iter().collect())
 }
 
-/// Searches for entries matching the given query.
-pub fn search_entries(user: &AuthenticatedUser, query: &str) -> Result<Vec<SearchResult>> {
-    let conn = Connection::open(db_path())?;
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT j.id, j.content, j.status, j.due_date, j.created_at, j.updated_at,
-               GROUP_CONCAT(t.name, ',') as tags
-        FROM journal j
-        LEFT JOIN entry_tags et ON j.id = et.entry_id
-        LEFT JOIN tags t ON et.tag_id = t.id
-        WHERE j.user_id = ?1
-          AND (
-            j.content LIKE ?2
-            OR j.status LIKE ?2
-            OR t.name LIKE ?2
-          )
-        GROUP BY j.id
-        ORDER BY j.created_at DESC
-        "#
-    )?;
-    let like_query = format!("%{}%", query);
-    let entry_iter = stmt.query_map(params![user.id, like_query], |row| {
-        let enc_content: String = row.get(1)?;
-        let enc_status: Option<String> = row.get(2)?;
-        let enc_due: Option<String> = row.get(3)?;
-        let tags_str: Option<String> = row.get(6)?;
-        Ok(SearchResult {
-            id: row.get(0)?,
-            content: decrypt_field(&user.key, &enc_content).unwrap_or_default(),
-            status: enc_status.and_then(|s| decrypt_field(&user.key, &s)).unwrap_or_default(),
-            due_date: enc_due.and_then(|d| decrypt_field(&user.key, &d)),
-            created_at: row.get(4)?,
-            updated_at: row.get(5)?,
-            tags: tags_str.map(|s| s.split(',').filter_map(|enc| decrypt_field(&user.key, enc)).collect()).unwrap_or_default(),
-        })
-    })?;
-    Ok(entry_iter.filter_map(Result::ok).collect())
-}
-
 /// Admin: Deletes all data for a user and resets their password.
 pub fn admin_reset_user(username: &str, new_password: &str) -> Result<()> {
     let conn = Connection::open(db_path())?;
