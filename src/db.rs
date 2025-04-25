@@ -7,6 +7,7 @@ use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 use aes_gcm::aead::{Aead};
 use base64::{engine::general_purpose, Engine as _};
 
+#[allow(dead_code)]
 pub struct Entry {
     pub id: i64,
     pub content: String,
@@ -18,6 +19,7 @@ pub struct Entry {
     pub user_id: i64,
 }
 
+#[allow(dead_code)]
 pub struct SearchResult {
     pub id: i64,
     pub content: String,
@@ -45,6 +47,15 @@ pub struct AuthenticatedUser {
     pub id: i64,
     pub username: String,
     pub key: [u8; 32], // AES-256 key
+}
+
+#[allow(dead_code)]
+pub struct AuditLog {
+    pub id: i64,
+    pub user_id: i64,
+    pub action: String,
+    pub details: Option<String>,
+    pub timestamp: String,
 }
 
 pub fn db_path() -> String {
@@ -87,6 +98,7 @@ pub fn init() -> Result<()> {
     create_users_table(&conn)?;
     migrate_recycle_bin(&conn)?;
     migrate_all(&conn)?;
+    init_audit_log(&conn)?;
     Ok(())
 }
 
@@ -166,6 +178,7 @@ pub fn add_entry(user: &AuthenticatedUser, content: &str, tags: Option<Vec<Strin
             )?;
         }
     }
+    log_action(user, "Added new entry", Some(content))?;
     Ok(())
 }
 
@@ -288,6 +301,7 @@ pub fn update_entry(user: &AuthenticatedUser, id: i64, content: Option<String>, 
             }
         }
     }
+    log_action(user, "Updated entry", Some(&format!("ID: {}", id)))?;
     Ok(())
 }
 
@@ -389,6 +403,7 @@ pub fn move_to_recycle_bin(user: &AuthenticatedUser, id: i64) -> Result<()> {
         conn.execute("DELETE FROM entry_tags WHERE entry_id = ?1 AND user_id = ?2", params![id, user.id])?;
         conn.execute("DELETE FROM journal WHERE id = ?1 AND user_id = ?2", params![id, user.id])?;
     }
+    log_action(user, "Moved entry to recycle bin", Some(&format!("ID: {}", id)))?;
     Ok(())
 }
 
@@ -425,6 +440,7 @@ pub fn recover_from_recycle_bin(user: &AuthenticatedUser, id: i64) -> Result<()>
         conn.execute("DELETE FROM recycle_bin_tags WHERE entry_id = ?1 AND user_id = ?2", params![id, user.id])?;
         conn.execute("DELETE FROM recycle_bin WHERE id = ?1 AND user_id = ?2", params![id, user.id])?;
     }
+    log_action(user, "Recovered entry from recycle bin", Some(&format!("ID: {}", id)))?;
     Ok(())
 }
 
@@ -443,6 +459,7 @@ pub fn purge_expired_recycle_bin(user: &AuthenticatedUser) -> Result<()> {
         "DELETE FROM recycle_bin WHERE deleted_at < ?1 AND user_id = ?2",
         params![cutoff, user.id],
     )?;
+    log_action(user, "Purged expired recycle bin entries", None)?;
     Ok(())
 }
 
@@ -489,12 +506,7 @@ pub fn change_password(user: &AuthenticatedUser, old_password: &str, new_passwor
     let conn = Connection::open(db_path())?;
     // Verify old password
     let mut stmt = conn.prepare("SELECT password_hash, salt FROM users WHERE id = ?1")?;
-    let mut rows = stmt.query(params![user.id])?;
-    let (hash, _salt_b64): (String, String) = if let Some(row) = rows.next()? {
-        (row.get(0)?, row.get(1)?)
-    } else {
-        return Err(rusqlite::Error::InvalidQuery);
-    };
+    let (hash, _salt_b64): (String, String) = stmt.query_row(params![user.id], |row| Ok((row.get(0)?, row.get(1)?)))?;
     let parsed_hash = argon2::password_hash::PasswordHash::new(&hash).unwrap();
     if Argon2::default().verify_password(old_password.as_bytes(), &parsed_hash).is_err() {
         return Err(rusqlite::Error::InvalidQuery); // Use a better error in real code
@@ -583,6 +595,54 @@ pub fn change_password(user: &AuthenticatedUser, old_password: &str, new_passwor
     Ok(())
 }
 
+pub fn init_audit_log(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            details TEXT,
+            timestamp TEXT NOT NULL
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+pub fn log_action(user: &AuthenticatedUser, action: &str, details: Option<&str>) -> Result<()> {
+    let conn = Connection::open(db_path())?;
+    migrate_all(&conn)?;
+    init_audit_log(&conn)?;
+    let now = chrono::Local::now().naive_local().to_string();
+    // Encrypt details field if present
+    let enc_details = details.map(|d| encrypt_field(&user.key, d));
+    let enc_action = encrypt_field(&user.key, action);
+    conn.execute(
+        "INSERT INTO audit_log (user_id, action, details, timestamp) VALUES (?1, ?2, ?3, ?4)",
+        params![user.id, enc_action, enc_details, now],
+    )?;
+    Ok(())
+}
+
+pub fn list_audit_log(user: &AuthenticatedUser) -> Result<Vec<AuditLog>> {
+    let conn = Connection::open(db_path())?;
+    migrate_all(&conn)?;
+    init_audit_log(&conn)?;
+    let mut stmt = conn.prepare("SELECT id, user_id, action, details, timestamp FROM audit_log WHERE user_id = ?1 ORDER BY timestamp DESC")?;
+    let log_iter = stmt.query_map(params![user.id], |row| {
+        let action_enc: String = row.get(2)?;
+        let details_enc: Option<String> = row.get(3)?;
+        Ok(AuditLog {
+            id: row.get(0)?,
+            user_id: row.get(1)?,
+            action: decrypt_field(&user.key, &action_enc).unwrap_or_default(),
+            details: details_enc.and_then(|d| decrypt_field(&user.key, &d)),
+            timestamp: row.get(4)?,
+        })
+    })?;
+    Ok(log_iter.filter_map(Result::ok).collect())
+}
+
 pub fn encrypt_field(key: &[u8; 32], plaintext: &str) -> String {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     let mut nonce_bytes = [0u8; 12];
@@ -667,4 +727,33 @@ pub fn search_entries(user: &AuthenticatedUser, query: &str) -> Result<Vec<Searc
         })
     })?;
     Ok(entry_iter.filter_map(Result::ok).collect())
+}
+
+pub fn admin_reset_user(username: &str, new_password: &str) -> Result<()> {
+    let conn = Connection::open(db_path())?;
+    // Find user id
+    let mut stmt = conn.prepare("SELECT id FROM users WHERE username = ?1")?;
+    let user_id: i64 = stmt.query_row(params![username], |row| row.get(0))?;
+    // Delete all user data (journal, tags, recycle bin, audit log)
+    conn.execute("DELETE FROM journal WHERE user_id = ?1", params![user_id])?;
+    conn.execute("DELETE FROM entry_tags WHERE user_id = ?1", params![user_id])?;
+    conn.execute("DELETE FROM recycle_bin WHERE user_id = ?1", params![user_id])?;
+    conn.execute("DELETE FROM recycle_bin_tags WHERE user_id = ?1", params![user_id])?;
+    conn.execute("DELETE FROM audit_log WHERE user_id = ?1", params![user_id])?;
+    // Set new password hash and salt
+    let salt = argon2::password_hash::SaltString::generate(&mut rand::rngs::OsRng);
+    let hash = Argon2::default().hash_password(new_password.as_bytes(), &salt).unwrap().to_string();
+    conn.execute(
+        "UPDATE users SET password_hash = ?1, salt = ?2 WHERE id = ?3",
+        params![hash, salt.as_str(), user_id],
+    )?;
+    // Log the admin reset in the audit log (for the affected user)
+    let now = chrono::Local::now().naive_local().to_string();
+    let action = encrypt_field(&[0u8; 32], "admin_reset");
+    let details = encrypt_field(&[0u8; 32], "Admin reset performed. All data deleted and password reset.");
+    conn.execute(
+        "INSERT INTO audit_log (user_id, action, details, timestamp) VALUES (?1, ?2, ?3, ?4)",
+        params![user_id, action, details, now],
+    )?;
+    Ok(())
 }
