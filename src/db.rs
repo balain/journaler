@@ -1,5 +1,6 @@
 use rusqlite::{params, Connection, Result, ToSql};
 use chrono::Local;
+use std::env;
 
 pub struct Entry {
     pub id: i64,
@@ -11,11 +12,36 @@ pub struct Entry {
     pub updated_at: Option<String>,
 }
 
+pub struct SearchResult {
+    pub id: i64,
+    pub content: String,
+    pub status: String,
+    pub tags: Vec<String>,
+    pub due_date: Option<String>,
+    pub created_at: String,
+    pub updated_at: Option<String>,
+}
+
+pub struct RecycleBinEntry {
+    pub id: i64,
+    pub content: String,
+    pub tags: Vec<String>,
+    pub due_date: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: Option<String>,
+    pub deleted_at: String,
+}
+
+fn db_path() -> String {
+    env::var("JOURNAL_DB").unwrap_or_else(|_| "journal.db".to_string())
+}
+
 pub fn init() -> Result<()> {
-    let conn = Connection::open("journal.db")?;
+    let conn = Connection::open(db_path())?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS journal (
-            id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             content TEXT NOT NULL,
             due_date TEXT,
             status TEXT,
@@ -41,11 +67,12 @@ pub fn init() -> Result<()> {
         )",
         [],
     )?;
+    migrate_recycle_bin(&conn)?;
     Ok(())
 }
 
 pub fn add_entry(content: &str, tags: Option<Vec<String>>, due: Option<String>, status: Option<String>) -> Result<()> {
-    let conn = Connection::open("journal.db")?;
+    let conn = Connection::open(db_path())?;
     let now = Local::now().naive_local().to_string();
     conn.execute(
         "INSERT INTO journal (content, due_date, status, created_at) VALUES (?1, ?2, ?3, ?4)",
@@ -81,7 +108,7 @@ fn get_or_create_tag(conn: &Connection, tag: &str) -> Result<i64> {
 }
 
 pub fn list_entries(tag: Option<String>, status: Option<String>) -> Result<Vec<Entry>> {
-    let conn = Connection::open("journal.db")?;
+    let conn = Connection::open(db_path())?;
     let mut query = "SELECT j.id, j.content, j.due_date, j.status, j.created_at, j.updated_at FROM journal j".to_string();
     let mut wheres = Vec::new();
     let mut params: Vec<Box<dyn ToSql>> = Vec::new();
@@ -125,7 +152,7 @@ fn get_tags_for_entry(conn: &Connection, entry_id: i64) -> Result<Vec<String>> {
 }
 
 pub fn update_entry(id: i64, content: Option<String>, tags: Option<Vec<String>>, remove_tags: Option<Vec<String>>, due: Option<String>, status: Option<String>) -> Result<()> {
-    let conn = Connection::open("journal.db")?;
+    let conn = Connection::open(db_path())?;
     let now = Local::now().naive_local().to_string();
     let mut set = Vec::new();
     let mut params: Vec<Box<dyn ToSql>> = Vec::new();
@@ -174,7 +201,7 @@ pub fn update_entry(id: i64, content: Option<String>, tags: Option<Vec<String>>,
 }
 
 pub fn get_entry(id: i64) -> Result<Option<Entry>> {
-    let conn = Connection::open("journal.db")?;
+    let conn = Connection::open(db_path())?;
     let mut stmt = conn.prepare("SELECT id, content, due_date, status, created_at, updated_at FROM journal WHERE id = ?1")?;
     let mut rows = stmt.query(params![id])?;
     if let Some(row) = rows.next()? {
@@ -195,14 +222,14 @@ pub fn get_entry(id: i64) -> Result<Option<Entry>> {
 }
 
 pub fn list_tags() -> Result<Vec<String>> {
-    let conn = Connection::open("journal.db")?;
+    let conn = Connection::open(db_path())?;
     let mut stmt = conn.prepare("SELECT name FROM tags ORDER BY name COLLATE NOCASE ASC")?;
     let tag_iter = stmt.query_map([], |row| row.get(0))?;
     Ok(tag_iter.filter_map(Result::ok).collect())
 }
 
 pub fn list_tags_with_counts() -> Result<Vec<(String, u32)>> {
-    let conn = Connection::open("journal.db")?;
+    let conn = Connection::open(db_path())?;
     let mut stmt = conn.prepare(
         "SELECT t.name, COUNT(et.entry_id) as usage_count \
          FROM tags t \
@@ -216,4 +243,175 @@ pub fn list_tags_with_counts() -> Result<Vec<(String, u32)>> {
         Ok((name, count))
     })?;
     Ok(tag_iter.filter_map(Result::ok).collect())
+}
+
+pub fn search_entries(query: &str) -> Result<Vec<SearchResult>> {
+    let conn = Connection::open(db_path())?;
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT j.id, j.content, j.status, j.due_date, j.created_at, j.updated_at,
+               GROUP_CONCAT(t.name, ',') as tags
+        FROM journal j
+        LEFT JOIN entry_tags et ON j.id = et.entry_id
+        LEFT JOIN tags t ON et.tag_id = t.id
+        WHERE j.content LIKE ?1
+           OR j.status LIKE ?1
+           OR t.name LIKE ?1
+        GROUP BY j.id
+        ORDER BY j.created_at DESC
+        "#
+    )?;
+    let like_query = format!("%{}%", query);
+    let entry_iter = stmt.query_map(params![like_query], |row| {
+        let tags_str: Option<String> = row.get(6)?;
+        Ok(SearchResult {
+            id: row.get(0)?,
+            content: row.get(1)?,
+            status: row.get(2)?,
+            due_date: row.get(3)?,
+            created_at: row.get(4)?,
+            updated_at: row.get(5)?,
+            tags: tags_str.map(|s| s.split(',').map(|t| t.to_string()).collect()).unwrap_or_default(),
+        })
+    })?;
+    Ok(entry_iter.filter_map(Result::ok).collect())
+}
+
+pub fn delete_entry(id: i64) -> Result<()> {
+    move_to_recycle_bin(id)
+}
+
+pub fn migrate_recycle_bin(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS recycle_bin (
+            id INTEGER PRIMARY KEY,
+            content TEXT NOT NULL,
+            due_date TEXT,
+            status TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT,
+            deleted_at TEXT NOT NULL
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS recycle_bin_tags (
+            entry_id INTEGER,
+            tag TEXT,
+            FOREIGN KEY(entry_id) REFERENCES recycle_bin(id)
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+pub fn move_to_recycle_bin(id: i64) -> Result<()> {
+    let conn = Connection::open(db_path())?;
+    migrate_recycle_bin(&conn)?;
+    let mut entry_stmt = conn.prepare("SELECT id, content, due_date, status, created_at, updated_at FROM journal WHERE id = ?1")?;
+    let mut rows = entry_stmt.query(params![id])?;
+    if let Some(row) = rows.next()? {
+        let now = chrono::Local::now().naive_local().to_string();
+        conn.execute(
+            "INSERT INTO recycle_bin (id, content, due_date, status, created_at, updated_at, deleted_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                now
+            ],
+        )?;
+        // Copy tags
+        let mut tag_stmt = conn.prepare("SELECT t.name FROM tags t INNER JOIN entry_tags et ON t.id = et.tag_id WHERE et.entry_id = ?1")?;
+        let tag_iter = tag_stmt.query_map(params![id], |row| row.get::<_, String>(0))?;
+        for tag in tag_iter.filter_map(Result::ok) {
+            conn.execute(
+                "INSERT INTO recycle_bin_tags (entry_id, tag) VALUES (?1, ?2)",
+                params![id, tag],
+            )?;
+        }
+        // Remove from main tables
+        conn.execute("DELETE FROM entry_tags WHERE entry_id = ?1", params![id])?;
+        conn.execute("DELETE FROM journal WHERE id = ?1", params![id])?;
+    }
+    Ok(())
+}
+
+pub fn recover_from_recycle_bin(id: i64) -> Result<()> {
+    let conn = Connection::open(db_path())?;
+    migrate_recycle_bin(&conn)?;
+    let mut entry_stmt = conn.prepare("SELECT content, due_date, status, created_at, updated_at FROM recycle_bin WHERE id = ?1")?;
+    let mut rows = entry_stmt.query(params![id])?;
+    if let Some(row) = rows.next()? {
+        conn.execute(
+            "INSERT INTO journal (content, due_date, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?
+            ],
+        )?;
+        let new_id = conn.last_insert_rowid();
+        // Restore tags
+        let mut tag_stmt = conn.prepare("SELECT tag FROM recycle_bin_tags WHERE entry_id = ?1")?;
+        let tag_iter = tag_stmt.query_map(params![id], |row| row.get::<_, String>(0))?;
+        for tag in tag_iter.filter_map(Result::ok) {
+            let tag_id = get_or_create_tag(&conn, &tag)?;
+            conn.execute(
+                "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)",
+                params![new_id, tag_id],
+            )?;
+        }
+        // Remove from recycle bin
+        conn.execute("DELETE FROM recycle_bin_tags WHERE entry_id = ?1", params![id])?;
+        conn.execute("DELETE FROM recycle_bin WHERE id = ?1", params![id])?;
+    }
+    Ok(())
+}
+
+pub fn purge_expired_recycle_bin() -> Result<()> {
+    let conn = Connection::open(db_path())?;
+    migrate_recycle_bin(&conn)?;
+    let thirty_days_ago = chrono::Local::now().naive_local() - chrono::Duration::days(30);
+    let cutoff = thirty_days_ago.to_string();
+    // Remove tags first
+    conn.execute(
+        "DELETE FROM recycle_bin_tags WHERE entry_id IN (SELECT id FROM recycle_bin WHERE deleted_at < ?1)",
+        params![cutoff],
+    )?;
+    conn.execute(
+        "DELETE FROM recycle_bin WHERE deleted_at < ?1",
+        params![cutoff],
+    )?;
+    Ok(())
+}
+
+pub fn list_recycle_bin() -> Result<Vec<RecycleBinEntry>> {
+    let conn = Connection::open(db_path())?;
+    migrate_recycle_bin(&conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, content, due_date, status, created_at, updated_at, deleted_at FROM recycle_bin ORDER BY deleted_at DESC"
+    )?;
+    let entry_iter = stmt.query_map([], |row| {
+        let id: i64 = row.get(0)?;
+        let mut tag_stmt = conn.prepare("SELECT tag FROM recycle_bin_tags WHERE entry_id = ?1")?;
+        let tag_iter = tag_stmt.query_map(params![id], |row| row.get::<_, String>(0))?;
+        let tags = tag_iter.filter_map(Result::ok).collect();
+        Ok(RecycleBinEntry {
+            id,
+            content: row.get(1)?,
+            due_date: row.get(2)?,
+            status: row.get(3)?,
+            created_at: row.get(4)?,
+            updated_at: row.get(5)?,
+            deleted_at: row.get(6)?,
+            tags,
+        })
+    })?;
+    Ok(entry_iter.filter_map(Result::ok).collect())
 }

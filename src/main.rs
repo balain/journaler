@@ -3,13 +3,21 @@ use clap::{Parser, Subcommand, ArgAction};
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
 use strsim::normalized_levenshtein;
 use std::io::{self, Write};
+use csv;
+use dialoguer::Confirm;
 
 #[derive(Parser)]
 #[command(name = "journaler")]
 #[command(about = "A CLI journal app", long_about = None)]
 struct Cli {
+    /// Show the user guide
+    #[arg(long, action = ArgAction::SetTrue)]
+    guide: bool,
+    /// Disable interactive prompts (for automated tests)
+    #[arg(long, hide = true, action = ArgAction::SetTrue)]
+    no_interactive: bool,
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -51,6 +59,33 @@ enum Commands {
     },
     /// List all tags
     Tags,
+    /// Full text search entries
+    Search {
+        /// Search query
+        query: String,
+    },
+    /// Export entries
+    Export {
+        /// Format: csv, md, or txt
+        #[arg(long)]
+        format: String,
+        /// Output file (optional; prints to stdout if not specified)
+        #[arg(long)]
+        output: Option<String>,
+    },
+    /// Delete a journal entry
+    Delete {
+        /// Entry ID to delete
+        id: i64,
+    },
+    /// List recycle bin entries
+    RecycleBin,
+    /// Recover an entry from the recycle bin
+    Recover {
+        id: i64,
+    },
+    /// Purge recycle bin (delete expired)
+    PurgeRecycleBin,
 }
 
 fn color_status(status: &str) -> String {
@@ -62,7 +97,7 @@ fn color_status(status: &str) -> String {
     }
 }
 
-fn prompt_for_similar_tag(new_tag: &str, existing_tags: &[String]) -> Option<String> {
+fn prompt_for_similar_tag(new_tag: &str, existing_tags: &[String], no_interactive: bool) -> Option<String> {
     let matches: Vec<&String> = existing_tags.iter()
         .filter(|t|
             t.eq_ignore_ascii_case(new_tag)
@@ -72,6 +107,10 @@ fn prompt_for_similar_tag(new_tag: &str, existing_tags: &[String]) -> Option<Str
         )
         .collect();
     if matches.is_empty() {
+        return None;
+    }
+    if no_interactive {
+        // Always add as new tag in test mode
         return None;
     }
     println!("A similar tag already exists:");
@@ -97,136 +136,315 @@ fn prompt_for_similar_tag(new_tag: &str, existing_tags: &[String]) -> Option<Str
     }
 }
 
+fn print_help() {
+    println!(r#"journaler: Command-line Journal App
+
+USAGE:
+    journaler <COMMAND> [OPTIONS]
+
+COMMANDS:
+    add <content> [--tags <tag> ...] [--due <date>] [--status <status>]
+        Add a new journal entry. Tags can be specified multiple times.
+    list [--tag <tag>] [--status <status>]
+        List journal entries, optionally filtered by tag or status.
+    update <id> [--content <content>] [--tags <tag> ...] [--remove-tag <tag> ...] [--due <date>] [--status <status>]
+        Update an entry. Add or remove tags, change content, due date, or status.
+    view <id>
+        View a specific entry by id.
+    tags
+        List all tags with usage counts.
+    search <query>
+        Search for entries containing the query string.
+    export [--format <format>] [--output <file>]
+        Export all entries in the chosen format (csv, md, txt) to the specified file or stdout.
+    delete <id>
+        Delete an entry by id.
+    recyclebin
+        List entries in the recycle bin.
+    recover <id>
+        Recover an entry from the recycle bin.
+    purgerecyclebin
+        Purge entries older than 30 days.
+
+OPTIONS:
+    --guide          Show this user guide
+    -t, --tags <tag>    Specify one or more tags (can repeat)
+        --remove-tag    Remove one or more tags (can repeat)
+        --due <date>    Set or update the due date (YYYY-MM-DD or natural language)
+        --status <s>    Set or update the status label
+
+EXAMPLES:
+    journaler add "Write a journal entry" --tags work --tags urgent --due 2025-05-01 --status "In Progress"
+    journaler list --tag work --status "Done"
+    journaler update 3 --tags project --remove-tag urgent --status Done
+    journaler tags
+    journaler search "journal entry"
+    journaler export --format csv --output entries.csv
+    journaler delete 1
+
+TIPS:
+- Tags are checked for similarity to existing tags to avoid duplicates.
+- Status can be any string (e.g., In Progress, Done, Late).
+- Dates accept YYYY-MM-DD or natural language ("tomorrow").
+- Use --guide to see this message at any time.
+"#);
+}
+
 fn main() {
     let cli = Cli::parse();
+    if cli.guide {
+        print_help();
+        return;
+    }
+    let no_interactive = cli.no_interactive;
     db::init().expect("Failed to initialize database");
     match cli.command {
-        Commands::Add { content, tags, due, status } => {
-            let mut tags_vec = Vec::new();
-            let all_tags = db::list_tags().expect("Failed to list tags");
-            for tag in tags {
-                if let Some(existing) = prompt_for_similar_tag(&tag, &all_tags) {
-                    tags_vec.push(existing);
-                } else {
-                    tags_vec.push(tag);
+        Some(cmd) => match cmd {
+            Commands::Add { content, tags, due, status } => {
+                let mut tags_vec = Vec::new();
+                let all_tags = db::list_tags().expect("Failed to list tags");
+                for tag in tags {
+                    if let Some(existing) = prompt_for_similar_tag(&tag, &all_tags, no_interactive) {
+                        tags_vec.push(existing);
+                    } else {
+                        tags_vec.push(tag);
+                    }
                 }
+                let tags_vec = if tags_vec.is_empty() { None } else { Some(tags_vec) };
+                db::add_entry(&content, tags_vec, due, status).expect("Add failed");
+                println!("Entry added.");
             }
-            let tags_vec = if tags_vec.is_empty() { None } else { Some(tags_vec) };
-            db::add_entry(&content, tags_vec, due, status).expect("Add failed");
-            println!("Entry added.");
-        }
-        Commands::List { tag, status } => {
-            let entries = db::list_entries(tag, status).expect("List failed");
-            let now = Local::now();
-            for e in entries {
-                let created_disp = {
-                    let created = &e.created_at;
-                    if let Ok(ndt) = NaiveDateTime::parse_from_str(created, "%Y-%m-%d %H:%M:%S%.f") {
-                        let dt: DateTime<Local> = Local.from_local_datetime(&ndt).unwrap();
-                        let diff = now.signed_duration_since(dt);
-                        if diff.num_minutes() < 120 && diff.num_seconds() >= 0 {
-                            if diff.num_minutes() < 1 {
-                                format!("just now")
-                            } else if diff.num_minutes() == 1 {
-                                format!("1 minute ago")
-                            } else if diff.num_minutes() < 60 {
-                                format!("{} minutes ago", diff.num_minutes())
-                            } else {
-                                let h = diff.num_minutes() / 60;
-                                let m = diff.num_minutes() % 60;
-                                if m == 0 {
-                                    format!("{} hour{} ago", h, if h == 1 { "" } else { "s" })
+            Commands::List { tag, status } => {
+                let entries = db::list_entries(tag, status).expect("List failed");
+                let now = Local::now();
+                for e in entries {
+                    let created_disp = {
+                        let created = &e.created_at;
+                        if let Ok(ndt) = NaiveDateTime::parse_from_str(created, "%Y-%m-%d %H:%M:%S%.f") {
+                            let dt: DateTime<Local> = Local.from_local_datetime(&ndt).unwrap();
+                            let diff = now.signed_duration_since(dt);
+                            if diff.num_minutes() < 120 && diff.num_seconds() >= 0 {
+                                if diff.num_minutes() < 1 {
+                                    format!("just now")
+                                } else if diff.num_minutes() == 1 {
+                                    format!("1 minute ago")
+                                } else if diff.num_minutes() < 60 {
+                                    format!("{} minutes ago", diff.num_minutes())
                                 } else {
-                                    format!("{} hour{} {} min ago", h, if h == 1 { "" } else { "s" }, m)
+                                    let h = diff.num_minutes() / 60;
+                                    let m = diff.num_minutes() % 60;
+                                    if m == 0 {
+                                        format!("{} hour{} ago", h, if h == 1 { "" } else { "s" })
+                                    } else {
+                                        format!("{} hour{} {} min ago", h, if h == 1 { "" } else { "s" }, m)
+                                    }
                                 }
+                            } else {
+                                created.clone()
                             }
                         } else {
                             created.clone()
                         }
-                    } else {
-                        created.clone()
-                    }
-                };
-                let last_mod_disp = if let Some(updated) = &e.updated_at {
-                    if let Ok(ndt) = NaiveDateTime::parse_from_str(updated, "%Y-%m-%d %H:%M:%S%.f") {
-                        let dt: DateTime<Local> = Local.from_local_datetime(&ndt).unwrap();
-                        let diff = now.signed_duration_since(dt);
-                        if diff.num_minutes() < 120 && diff.num_seconds() >= 0 {
-                            if diff.num_minutes() < 1 {
-                                format!("just now")
-                            } else if diff.num_minutes() == 1 {
-                                format!("1 minute ago")
-                            } else if diff.num_minutes() < 60 {
-                                format!("{} minutes ago", diff.num_minutes())
-                            } else {
-                                let h = diff.num_minutes() / 60;
-                                let m = diff.num_minutes() % 60;
-                                if m == 0 {
-                                    format!("{} hour{} ago", h, if h == 1 { "" } else { "s" })
+                    };
+                    let last_mod_disp = if let Some(updated) = &e.updated_at {
+                        if let Ok(ndt) = NaiveDateTime::parse_from_str(updated, "%Y-%m-%d %H:%M:%S%.f") {
+                            let dt: DateTime<Local> = Local.from_local_datetime(&ndt).unwrap();
+                            let diff = now.signed_duration_since(dt);
+                            if diff.num_minutes() < 120 && diff.num_seconds() >= 0 {
+                                if diff.num_minutes() < 1 {
+                                    format!("just now")
+                                } else if diff.num_minutes() == 1 {
+                                    format!("1 minute ago")
+                                } else if diff.num_minutes() < 60 {
+                                    format!("{} minutes ago", diff.num_minutes())
                                 } else {
-                                    format!("{} hour{} {} min ago", h, if h == 1 { "" } else { "s" }, m)
+                                    let h = diff.num_minutes() / 60;
+                                    let m = diff.num_minutes() % 60;
+                                    if m == 0 {
+                                        format!("{} hour{} ago", h, if h == 1 { "" } else { "s" })
+                                    } else {
+                                        format!("{} hour{} {} min ago", h, if h == 1 { "" } else { "s" }, m)
+                                    }
                                 }
+                            } else {
+                                updated.clone()
                             }
                         } else {
                             updated.clone()
                         }
                     } else {
-                        updated.clone()
+                        "-".to_string()
+                    };
+                    let status_colored = color_status(&e.status);
+                    let mut fields = vec![
+                        format!("{}: {}", e.id, e.content),
+                        format!("[status: {}]", status_colored),
+                        format!("[created: {}]", created_disp),
+                        format!("[last modified: {}]", last_mod_disp),
+                    ];
+                    if !e.tags.is_empty() {
+                        fields.insert(1, format!("[tags: {}]", e.tags.join(", ")));
                     }
+                    if let Some(due) = &e.due_date {
+                        if !due.trim().is_empty() {
+                            let idx = if !e.tags.is_empty() { 2 } else { 1 };
+                            fields.insert(idx, format!("[due: {}]", due));
+                        }
+                    }
+                    println!("{}", fields.join(" "));
+                }
+            }
+            Commands::Update { id, content, tags, remove_tag, due, status } => {
+                let mut tags_vec = Vec::new();
+                let all_tags = db::list_tags().expect("Failed to list tags");
+                for tag in tags {
+                    if let Some(existing) = prompt_for_similar_tag(&tag, &all_tags, no_interactive) {
+                        tags_vec.push(existing);
+                    } else {
+                        tags_vec.push(tag);
+                    }
+                }
+                let tags_vec = if tags_vec.is_empty() { None } else { Some(tags_vec) };
+                let remove_tags_vec = if remove_tag.is_empty() { None } else { Some(remove_tag.clone()) };
+                db::update_entry(id, content, tags_vec, remove_tags_vec, due, status).expect("Update failed");
+                println!("Entry updated.");
+            }
+            Commands::View { id } => {
+                if let Some(e) = db::get_entry(id).expect("View failed") {
+                    println!("{}: {} [tags: {}] [due: {:?}] [status: {}] [created: {}] [updated: {:?}]", e.id, e.content, e.tags.join(", "), e.due_date, e.status, e.created_at, e.updated_at);
                 } else {
-                    "-".to_string()
+                    println!("Entry not found.");
+                }
+            }
+            Commands::Tags => {
+                let tags = db::list_tags_with_counts().expect("Failed to list tags");
+                if tags.is_empty() {
+                    println!("No tags found.");
+                } else {
+                    println!("Available tags:");
+                    for (t, count) in tags {
+                        println!("- {} ({})", t, count);
+                    }
+                }
+            }
+            Commands::Search { query } => {
+                let results = db::search_entries(&query).expect("Search failed");
+                if results.is_empty() {
+                    println!("No entries found matching '{}'.", query);
+                } else {
+                    println!("Results for '{}':", query);
+                    for e in results {
+                        let tags = if e.tags.is_empty() { String::new() } else { format!("[tags: {}]", e.tags.join(", ")) };
+                        let due = e.due_date.as_ref().map(|d| format!("[due: {}]", d)).unwrap_or_default();
+                        println!("{}: {} {} {} [status: {}] [created: {}] [updated: {}]", e.id, e.content, tags, due, e.status, e.created_at, e.updated_at.as_deref().unwrap_or("-"));
+                    }
+                }
+            }
+            Commands::Export { format, output } => {
+                let entries = db::list_entries(None, None).expect("Export failed");
+                let fmt = format.to_lowercase();
+                let data = match fmt.as_str() {
+                    "csv" => {
+                        let mut wtr = csv::Writer::from_writer(vec![]);
+                        wtr.write_record(["id", "content", "tags", "due_date", "status", "created_at", "updated_at"]).unwrap();
+                        for e in &entries {
+                            wtr.write_record([
+                                e.id.to_string(),
+                                e.content.clone(),
+                                e.tags.join(", "),
+                                e.due_date.as_deref().unwrap_or("").to_string(),
+                                e.status.clone(),
+                                e.created_at.clone(),
+                                e.updated_at.as_deref().unwrap_or("").to_string()
+                            ]).unwrap();
+                        }
+                        String::from_utf8(wtr.into_inner().unwrap()).unwrap()
+                    },
+                    "md" | "markdown" => {
+                        let mut s = String::new();
+                        for e in &entries {
+                            s.push_str(&format!("## {}\n\n- **Tags:** {}\n- **Due:** {}\n- **Status:** {}\n- **Created:** {}\n- **Updated:** {}\n\n{}\n\n---\n\n",
+                                e.id,
+                                if e.tags.is_empty() { "-".to_string() } else { e.tags.join(", ") },
+                                e.due_date.as_deref().unwrap_or("-"),
+                                e.status,
+                                e.created_at,
+                                e.updated_at.as_deref().unwrap_or("-"),
+                                e.content
+                            ));
+                        }
+                        s
+                    },
+                    "txt" | "text" => {
+                        let mut s = String::new();
+                        for e in &entries {
+                            s.push_str(&format!("#{} | {} | [{}] | Due: {} | Status: {} | Created: {} | Updated: {}\n{}\n\n",
+                                e.id,
+                                e.content,
+                                if e.tags.is_empty() { "".to_string() } else { e.tags.join(", ") },
+                                e.due_date.as_deref().unwrap_or("-"),
+                                e.status,
+                                e.created_at,
+                                e.updated_at.as_deref().unwrap_or("-"),
+                                e.content
+                            ));
+                        }
+                        s
+                    },
+                    _ => {
+                        eprintln!("Unknown export format: {}. Use csv, md, or txt.", format);
+                        return;
+                    }
                 };
-                let status_colored = color_status(&e.status);
-                let mut fields = vec![
-                    format!("{}: {}", e.id, e.content),
-                    format!("[status: {}]", status_colored),
-                    format!("[created: {}]", created_disp),
-                    format!("[last modified: {}]", last_mod_disp),
-                ];
-                if !e.tags.is_empty() {
-                    fields.insert(1, format!("[tags: {}]", e.tags.join(", ")));
+                if let Some(path) = output {
+                    std::fs::write(&path, data).expect("Failed to write export file");
+                    println!("Exported to {}", path);
+                } else {
+                    println!("{}", data);
                 }
-                if let Some(due) = &e.due_date {
-                    if !due.trim().is_empty() {
-                        let idx = if !e.tags.is_empty() { 2 } else { 1 };
-                        fields.insert(idx, format!("[due: {}]", due));
+            }
+            Commands::Delete { id } => {
+                let entry = db::get_entry(id).expect("Failed to get entry");
+                if entry.is_none() {
+                    println!("Entry not found.");
+                    return;
+                }
+                let entry = entry.unwrap();
+                println!("You are about to delete entry #{}: {}", entry.id, entry.content);
+                if cli.no_interactive || Confirm::new().with_prompt("Are you sure you want to delete this entry? It will be moved to the recycle bin for 30 days.").default(false).interact().unwrap() {
+                    db::delete_entry(id).expect("Delete failed");
+                    println!("Entry {} moved to recycle bin.", id);
+                } else {
+                    println!("Aborted. Entry not deleted.");
+                }
+            }
+            Commands::RecycleBin => {
+                let entries = db::list_recycle_bin().expect("Failed to list recycle bin");
+                if entries.is_empty() {
+                    println!("Recycle bin is empty.");
+                } else {
+                    println!("Entries in recycle bin (recoverable for up to 30 days):");
+                    for e in entries {
+                        println!("#{}: {} [tags: {}] [due: {}] [status: {}] [deleted: {}]", e.id, e.content, e.tags.join(", "), e.due_date.as_deref().unwrap_or("-"), e.status, e.deleted_at);
                     }
                 }
-                println!("{}", fields.join(" "));
             }
-        }
-        Commands::Update { id, content, tags, remove_tag, due, status } => {
-            let mut tags_vec = Vec::new();
-            let all_tags = db::list_tags().expect("Failed to list tags");
-            for tag in tags {
-                if let Some(existing) = prompt_for_similar_tag(&tag, &all_tags) {
-                    tags_vec.push(existing);
-                } else {
-                    tags_vec.push(tag);
+            Commands::Recover { id } => {
+                let entries = db::list_recycle_bin().expect("Failed to list recycle bin");
+                if !entries.iter().any(|e| e.id == id) {
+                    println!("Entry not found in recycle bin.");
+                    return;
                 }
+                db::recover_from_recycle_bin(id).expect("Recover failed");
+                println!("Entry {} recovered from recycle bin.", id);
             }
-            let tags_vec = if tags_vec.is_empty() { None } else { Some(tags_vec) };
-            let remove_tags_vec = if remove_tag.is_empty() { None } else { Some(remove_tag.clone()) };
-            db::update_entry(id, content, tags_vec, remove_tags_vec, due, status).expect("Update failed");
-            println!("Entry updated.");
-        }
-        Commands::View { id } => {
-            if let Some(e) = db::get_entry(id).expect("View failed") {
-                println!("{}: {} [tags: {}] [due: {:?}] [status: {}] [created: {}] [updated: {:?}]", e.id, e.content, e.tags.join(", "), e.due_date, e.status, e.created_at, e.updated_at);
-            } else {
-                println!("Entry not found.");
+            Commands::PurgeRecycleBin => {
+                db::purge_expired_recycle_bin().expect("Purge failed");
+                println!("Expired entries purged from recycle bin.");
             }
-        }
-        Commands::Tags => {
-            let tags = db::list_tags_with_counts().expect("Failed to list tags");
-            if tags.is_empty() {
-                println!("No tags found.");
-            } else {
-                println!("Available tags:");
-                for (t, count) in tags {
-                    println!("- {} ({})", t, count);
-                }
-            }
+        },
+        None => {
+            print_help();
         }
     }
 }
