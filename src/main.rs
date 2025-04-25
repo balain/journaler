@@ -475,7 +475,7 @@ fn main() {
                 }
             }
             Commands::List { tag, status } => {
-                let entries = db::list_entries(&user, tag.clone(), status.clone()).expect("List failed");
+                let entries = db::list_entries(&user, tag.as_ref(), status.as_ref()).expect("List failed");
                 debug_println!("[DEBUG] List command: loaded {} entries from DB", entries.len());
                 for (i, e) in entries.iter().enumerate() {
                     debug_println!("[DEBUG] Entry {}: id={}, content='{}', tags={:?}, due_date={:?}, status='{}', created_at={}, updated_at={:?}, user_id={}",

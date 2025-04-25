@@ -247,20 +247,20 @@ fn get_or_create_tag(conn: &Connection, tag: &str) -> Result<i64> {
 }
 
 /// Lists all journal entries for a user, optionally filtering by tag/status.
-pub fn list_entries(user: &AuthenticatedUser, tag: Option<String>, status: Option<String>) -> Result<Vec<Entry>> {
+pub fn list_entries(user: &AuthenticatedUser, tag: Option<&String>, status: Option<&String>) -> Result<Vec<Entry>> {
     let conn = Connection::open(db_path())?;
     migrate_all(&conn);
     let mut query = "SELECT j.id, j.content, j.due_date, j.status, j.created_at, j.updated_at, j.user_id FROM journal j".to_string();
     let mut wheres = Vec::new();
     let mut params: Vec<Box<dyn ToSql>> = Vec::new();
-    if tag.is_some() {
+    if let Some(ref tag_val) = tag {
         query.push_str(" JOIN entry_tags et ON j.id = et.entry_id JOIN tags t ON et.tag_id = t.id");
         wheres.push("t.name = ?");
-        params.push(Box::new(tag));
+        params.push(Box::new(tag_val));
     }
-    if status.is_some() {
+    if let Some(ref status_val) = status {
         wheres.push("j.status = ?");
-        params.push(Box::new(status.unwrap()));
+        params.push(Box::new(status_val));
     }
     wheres.push("j.user_id = ?");
     params.push(Box::new(user.id));
