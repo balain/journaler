@@ -25,4 +25,4 @@ jobs:
       - name: Add binary to PATH
         run: echo "$GITHUB_WORKSPACE/target/release" >> $GITHUB_PATH
       - name: Run tests
-        run: cargo test
+        run: cargo test --release
