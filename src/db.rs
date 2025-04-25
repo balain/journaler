@@ -369,7 +369,7 @@ pub fn move_to_recycle_bin(user: &AuthenticatedUser, id: i64) -> Result<()> {
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
-                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(3)?.unwrap_or_default(),
                 row.get::<_, String>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 now,
