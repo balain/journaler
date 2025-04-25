@@ -22,4 +22,5 @@ jobs:
           override: true
       - name: Build
         run: cargo build --release
-
+      - name: Add binary to PATH
+        run: echo "$GITHUB_WORKSPACE/target/release" >> $GITHUB_PATH
