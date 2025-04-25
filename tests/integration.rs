@@ -2,11 +2,9 @@ use std::fs;
 use std::process::Command;
 use std::env;
 use std::sync::Once;
-use std::path::Path;
-use rusqlite;
-use argon2::{Argon2, password_hash::{SaltString, PasswordHasher}};
-use rand::rngs::OsRng;
-use dirs;
+use argon2::{Argon2, password_hash::{ PasswordHasher}};
+
+type EntryRow = (i64, String, Option<String>, Option<String>, String, Option<String>, i64);
 
 macro_rules! debug_println {
     ($($arg:tt)*) => {
@@ -23,7 +21,7 @@ fn setup_db() {
     INIT.call_once(|| {
         let _ = fs::remove_file("test_journal.db");
         // Remove session file if it exists
-        let session_path = dirs::config_dir().unwrap_or_else(|| std::path::PathBuf::from(".")).join("journaler_session.json");
+        let session_path = std::env::current_dir().unwrap().join("journaler_session.json");
         let _ = fs::remove_file(&session_path);
         let conn = rusqlite::Connection::open("test_journal.db").expect("Failed to open test DB");
         let _ = conn.execute(
@@ -40,7 +38,7 @@ fn setup_db() {
         let hash = argon2.hash_password(password.as_bytes(), &salt).unwrap().to_string();
         let _ = conn.execute(
             "INSERT OR IGNORE INTO users (username, password_hash, salt) VALUES (?1, ?2, ?3)",
-            &["testuser", &hash, salt.as_str()],
+            ["testuser", &hash, salt.as_str()],
         );
         // Print salt and hash for debugging
         debug_println!("TEST USER salt: {}", salt.as_str());
@@ -111,7 +109,7 @@ fn test_add_and_list_entry() {
     debug_println!("ADD OUTPUT: {}", out);
     // Print all journal entries after add
     let mut stmt = conn.prepare("SELECT id, content, due_date, status, created_at, updated_at, user_id FROM journal").unwrap();
-    let entries: Vec<(i64, String, Option<String>, Option<String>, String, Option<String>, i64)> = stmt
+    let entries: Vec<EntryRow> = stmt
         .query_map([], |row| Ok((
             row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?
         )))
@@ -193,7 +191,7 @@ fn test_export_md_and_txt() {
 
 #[cfg(test)]
 mod cleanup {
-    use super::*;
+    // use super::*;
     #[test]
     fn cleanup_after_tests() {
         super::cleanup_db();
