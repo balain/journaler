@@ -378,7 +378,7 @@ pub fn update_entry(user: &AuthenticatedUser, id: i64, content: Option<String>, 
             }
         }
     }
-    log_action(user, "Updated entry", Some(&format!("ID: {id}"))?;
+    let _ = log_action(user, "Updated entry", Some(&format!("ID: {id}")));
     Ok(())
 }
 
@@ -484,7 +484,7 @@ pub fn move_to_recycle_bin(user: &AuthenticatedUser, id: i64) -> Result<()> {
         conn.execute("DELETE FROM entry_tags WHERE entry_id = ?1 AND user_id = ?2", params![id, user.id])?;
         conn.execute("DELETE FROM journal WHERE id = ?1 AND user_id = ?2", params![id, user.id])?;
     }
-    log_action(user, "Moved entry to recycle bin", Some(&format!("ID: {id}"))?;
+    let _ = log_action(user, "Moved entry to recycle bin", Some(&format!("ID: {id}")));
     Ok(())
 }
 
@@ -522,7 +522,7 @@ pub fn recover_from_recycle_bin(user: &AuthenticatedUser, id: i64) -> Result<()>
         conn.execute("DELETE FROM recycle_bin_tags WHERE entry_id = ?1 AND user_id = ?2", params![id, user.id])?;
         conn.execute("DELETE FROM recycle_bin WHERE id = ?1 AND user_id = ?2", params![id, user.id])?;
     }
-    log_action(user, "Recovered entry from recycle bin", Some(&format!("ID: {id}"))?;
+    let _ = log_action(user, "Recovered entry from recycle bin", Some(&format!("ID: {id}")));
     Ok(())
 }
 

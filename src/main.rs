@@ -264,6 +264,7 @@ NOTES:
     - Entries are encrypted and stored locally in SQLite.
     - Use 'clean-legacy' to remove all data not owned by a user.
 ");
+}
 
 /// Entry point: parses CLI args, manages session, and dispatches commands.
 fn main() {
