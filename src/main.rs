@@ -1,3 +1,9 @@
+// main.rs - Main CLI logic for Journaler
+// Handles user interaction, command parsing, session management, and output formatting.
+// - Defines CLI commands (add, update, delete, list, tags, recycle bin, audit log, admin reset, etc.)
+// - Manages user authentication/session, prompts, and guides
+// - Calls db.rs for all persistent operations and encryption
+
 mod db;
 use clap::{Parser, Subcommand, ArgAction};
 use strsim::normalized_levenshtein;
@@ -19,6 +25,7 @@ struct UserSession {
     last_active: u64, // unix timestamp (seconds)
 }
 
+/// Returns the path to the session JSON file in the user's config directory.
 fn session_path() -> PathBuf {
     let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
     path.push("journaler_session.json");
@@ -26,17 +33,7 @@ fn session_path() -> PathBuf {
     path
 }
 
-fn now_ts() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
-}
-
-fn session_timeout_secs() -> u64 {
-    std::env::var("JOURNALER_SESSION_TIMEOUT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1800)
-}
-
+/// Loads the current session from disk if it exists and is valid.
 fn load_session() -> Option<UserSession> {
     let path = session_path();
     if let Ok(data) = fs::read_to_string(&path) {
@@ -52,6 +49,7 @@ fn load_session() -> Option<UserSession> {
     None
 }
 
+/// Saves the current session to disk as JSON.
 fn save_session(user: &db::AuthenticatedUser) {
     let session = UserSession {
         user_id: user.id,
@@ -62,111 +60,25 @@ fn save_session(user: &db::AuthenticatedUser) {
     let _ = fs::write(session_path(), serde_json::to_string(&session).unwrap());
 }
 
+/// Clears the session file from disk.
 fn clear_session() {
     let _ = fs::remove_file(session_path());
 }
 
-#[derive(Parser)]
-#[command(name = "journaler")]
-#[command(about = "A CLI journal app", long_about = None)]
-struct Cli {
-    /// Show the user guide
-    #[arg(long, action = ArgAction::SetTrue)]
-    guide: bool,
-    /// Disable interactive prompts (for automated tests)
-    #[arg(long, hide = true, action = ArgAction::SetTrue)]
-    no_interactive: bool,
-    #[arg(long, default_value_t = 1800)]
-    session_timeout: u64,
-    #[command(subcommand)]
-    command: Option<Commands>,
+/// Returns the current Unix timestamp in seconds.
+fn now_ts() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Add a new journal entry
-    Add {
-        content: String,
-        #[arg(short, long, action = ArgAction::Append)]
-        tags: Vec<String>,
-        #[arg(short, long)]
-        due: Option<String>,
-        #[arg(short, long)]
-        status: Option<String>,
-    },
-    /// List all entries
-    List {
-        #[arg(short, long)]
-        tag: Option<String>,
-        #[arg(short, long)]
-        status: Option<String>,
-    },
-    /// Update an entry by id
-    Update {
-        id: i64,
-        #[arg(short, long)]
-        content: Option<String>,
-        #[arg(short, long, action = ArgAction::Append)]
-        tags: Vec<String>,
-        #[arg(long, action = ArgAction::Append)]
-        remove_tag: Vec<String>,
-        #[arg(short, long)]
-        due: Option<String>,
-        #[arg(short, long)]
-        status: Option<String>,
-    },
-    /// View a specific entry
-    View {
-        id: i64,
-    },
-    /// List all tags
-    Tags,
-    /// Full text search entries
-    Search {
-        /// Search query
-        query: String,
-    },
-    /// Export entries
-    Export {
-        /// Format: csv, md, or txt
-        #[arg(long)]
-        format: String,
-        /// Output file (optional; prints to stdout if not specified)
-        #[arg(long)]
-        output: Option<String>,
-    },
-    /// Delete a journal entry
-    Delete {
-        /// Entry ID to delete
-        id: i64,
-    },
-    /// List recycle bin entries
-    RecycleBin,
-    /// Recover an entry from the recycle bin
-    Recover {
-        id: i64,
-    },
-    /// Purge recycle bin (delete expired)
-    PurgeRecycleBin,
-    /// Register a new user
-    RegisterUser,
-    /// Clean up legacy data
-    CleanLegacy,
-    /// Change your password
-    ChangePassword,
-    /// Log out and clear your session
-    Logout,
-    /// View the audit log
-    AuditLog,
-    /// Admin: Reset a user's password (deletes all their data)
-    AdminReset {
-        /// Username to reset
-        username: String,
-        /// New password
-        new_password: String,
-    },
+/// Returns the session timeout in seconds.
+fn session_timeout_secs() -> u64 {
+    std::env::var("JOURNALER_SESSION_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1800)
 }
 
+/// Prompts for login and creates a session if authentication succeeds.
 fn require_auth() -> db::AuthenticatedUser {
     if let Some(session) = load_session() {
         return db::AuthenticatedUser { id: session.user_id, username: session.username, key: session.key };
@@ -190,7 +102,7 @@ fn require_auth() -> db::AuthenticatedUser {
     }
 }
 
-#[allow(dead_code)]
+/// Formats a status string with color.
 fn color_status(status: &str) -> String {
     match status.to_lowercase().as_str() {
         "in progress" => format!("\x1b[32m{}\x1b[0m", status), // green
@@ -200,6 +112,7 @@ fn color_status(status: &str) -> String {
     }
 }
 
+/// Prompts the user to choose a similar tag if one exists.
 fn prompt_for_similar_tag(new_tag: &str, existing_tags: &[String], no_interactive: bool) -> Option<String> {
     let matches: Vec<&String> = existing_tags.iter()
         .filter(|t|
@@ -239,6 +152,7 @@ fn prompt_for_similar_tag(new_tag: &str, existing_tags: &[String], no_interactiv
     }
 }
 
+/// Prints the CLI user guide.
 fn print_help() {
     println!(r#"\
 USAGE:
@@ -276,6 +190,7 @@ SECURITY:
 "#);
 }
 
+/// Entry point: parses CLI args, manages session, and dispatches commands.
 fn main() {
     db::init().expect("Failed to initialize database");
     let cli = Cli::parse();
@@ -519,4 +434,105 @@ fn main() {
             print_help();
         }
     }
+}
+
+#[derive(Parser)]
+#[command(name = "journaler")]
+#[command(about = "A CLI journal app", long_about = None)]
+struct Cli {
+    /// Show the user guide
+    #[arg(long, action = ArgAction::SetTrue)]
+    guide: bool,
+    /// Disable interactive prompts (for automated tests)
+    #[arg(long, hide = true, action = ArgAction::SetTrue)]
+    no_interactive: bool,
+    #[arg(long, default_value_t = 1800)]
+    session_timeout: u64,
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Add a new journal entry
+    Add {
+        content: String,
+        #[arg(short, long, action = ArgAction::Append)]
+        tags: Vec<String>,
+        #[arg(short, long)]
+        due: Option<String>,
+        #[arg(short, long)]
+        status: Option<String>,
+    },
+    /// List all entries
+    List {
+        #[arg(short, long)]
+        tag: Option<String>,
+        #[arg(short, long)]
+        status: Option<String>,
+    },
+    /// Update an entry by id
+    Update {
+        id: i64,
+        #[arg(short, long)]
+        content: Option<String>,
+        #[arg(short, long, action = ArgAction::Append)]
+        tags: Vec<String>,
+        #[arg(long, action = ArgAction::Append)]
+        remove_tag: Vec<String>,
+        #[arg(short, long)]
+        due: Option<String>,
+        #[arg(short, long)]
+        status: Option<String>,
+    },
+    /// View a specific entry
+    View {
+        id: i64,
+    },
+    /// List all tags
+    Tags,
+    /// Full text search entries
+    Search {
+        /// Search query
+        query: String,
+    },
+    /// Export entries
+    Export {
+        /// Format: csv, md, or txt
+        #[arg(long)]
+        format: String,
+        /// Output file (optional; prints to stdout if not specified)
+        #[arg(long)]
+        output: Option<String>,
+    },
+    /// Delete a journal entry
+    Delete {
+        /// Entry ID to delete
+        id: i64,
+    },
+    /// List recycle bin entries
+    RecycleBin,
+    /// Recover an entry from the recycle bin
+    Recover {
+        id: i64,
+    },
+    /// Purge recycle bin (delete expired)
+    PurgeRecycleBin,
+    /// Register a new user
+    RegisterUser,
+    /// Clean up legacy data
+    CleanLegacy,
+    /// Change your password
+    ChangePassword,
+    /// Log out and clear your session
+    Logout,
+    /// View the audit log
+    AuditLog,
+    /// Admin: Reset a user's password (deletes all their data)
+    AdminReset {
+        /// Username to reset
+        username: String,
+        /// New password
+        new_password: String,
+    },
 }

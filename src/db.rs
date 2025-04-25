@@ -1,3 +1,8 @@
+// db.rs - Database and encryption logic for Journaler CLI app
+// Handles all persistent storage, encryption, and user/session management.
+// - Defines data models (Entry, AuthenticatedUser, AuditLog, etc.)
+// - Provides functions for CRUD operations, authentication, tag management, recycle bin, audit logging, encryption, and admin reset.
+
 use rusqlite::{params, Connection, Result, ToSql};
 use chrono::Local;
 use std::env;
@@ -7,61 +12,101 @@ use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 use aes_gcm::aead::{Aead};
 use base64::{engine::general_purpose, Engine as _};
 
+/// Entry struct represents a journal entry in the database.
 #[allow(dead_code)]
 pub struct Entry {
+    /// Unique entry ID.
     pub id: i64,
+    /// Entry content.
     pub content: String,
+    /// List of tags associated with the entry.
     pub tags: Vec<String>,
+    /// Due date for the entry (optional).
     pub due_date: Option<String>,
+    /// Status of the entry (e.g., "todo", "done").
     pub status: String,
+    /// Timestamp when the entry was created.
     pub created_at: String,
+    /// Timestamp when the entry was last updated (optional).
     pub updated_at: Option<String>,
+    /// ID of the user who owns the entry.
     pub user_id: i64,
 }
 
+/// SearchResult struct for search query results.
 #[allow(dead_code)]
 pub struct SearchResult {
+    /// Unique entry ID.
     pub id: i64,
+    /// Entry content.
     pub content: String,
-    pub status: String,
+    /// List of tags associated with the entry.
     pub tags: Vec<String>,
+    /// Due date for the entry (optional).
     pub due_date: Option<String>,
+    /// Status of the entry (e.g., "todo", "done").
+    pub status: String,
+    /// Timestamp when the entry was created.
     pub created_at: String,
+    /// Timestamp when the entry was last updated (optional).
     pub updated_at: Option<String>,
 }
 
+/// AuthenticatedUser contains user id, username, and encryption key for session.
 #[allow(dead_code)]
-pub struct RecycleBinEntry {
-    pub id: i64,
-    pub content: String,
-    pub tags: Vec<String>,
-    pub due_date: Option<String>,
-    pub status: String,
-    pub created_at: String,
-    pub updated_at: Option<String>,
-    pub deleted_at: String,
-    pub user_id: i64,
-}
-
 pub struct AuthenticatedUser {
+    /// Unique user ID.
     pub id: i64,
+    /// Username chosen by the user.
     pub username: String,
-    pub key: [u8; 32], // AES-256 key
+    /// AES-256 encryption key for the user's session.
+    pub key: [u8; 32],
 }
 
+/// AuditLog struct represents an audit log entry (action, details, timestamp).
 #[allow(dead_code)]
 pub struct AuditLog {
+    /// Unique audit log entry ID.
     pub id: i64,
+    /// ID of the user who performed the action.
     pub user_id: i64,
+    /// Action performed (e.g., "added entry", "updated entry").
     pub action: String,
+    /// Additional details about the action (optional).
     pub details: Option<String>,
+    /// Timestamp when the action was performed.
     pub timestamp: String,
 }
 
+/// RecycleBinEntry struct represents an entry in the recycle bin.
+#[allow(dead_code)]
+pub struct RecycleBinEntry {
+    /// Unique entry ID.
+    pub id: i64,
+    /// Entry content.
+    pub content: String,
+    /// List of tags associated with the entry.
+    pub tags: Vec<String>,
+    /// Due date for the entry (optional).
+    pub due_date: Option<String>,
+    /// Status of the entry (e.g., "todo", "done").
+    pub status: String,
+    /// Timestamp when the entry was created.
+    pub created_at: String,
+    /// Timestamp when the entry was last updated (optional).
+    pub updated_at: Option<String>,
+    /// Timestamp when the entry was deleted.
+    pub deleted_at: String,
+    /// ID of the user who owns the entry.
+    pub user_id: i64,
+}
+
+/// Returns the path to the SQLite DB file (from env or default).
 pub fn db_path() -> String {
     env::var("JOURNAL_DB").unwrap_or_else(|_| "journal.db".to_string())
 }
 
+/// Initializes all DB tables if missing (users, journal, tags, recycle bin, audit log).
 pub fn init() -> Result<()> {
     let conn = Connection::open(db_path())?;
     conn.execute(
@@ -102,6 +147,7 @@ pub fn init() -> Result<()> {
     Ok(())
 }
 
+/// Creates the users table if it does not exist.
 pub fn create_users_table(conn: &Connection) -> Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS users (
@@ -115,6 +161,7 @@ pub fn create_users_table(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Registers a new user with the given username and password.
 pub fn register_user(conn: &Connection, username: &str, password: &str) -> Result<AuthenticatedUser> {
     init()?; // Ensure all tables exist
     let salt = SaltString::generate(&mut OsRng);
@@ -130,6 +177,7 @@ pub fn register_user(conn: &Connection, username: &str, password: &str) -> Resul
     Ok(AuthenticatedUser { id, username: username.to_string(), key })
 }
 
+/// Logs in a user with the given username and password.
 pub fn login_user(conn: &Connection, username: &str, password: &str) -> Result<Option<AuthenticatedUser>> {
     init()?; // Ensure all tables exist
     let mut stmt = conn.prepare("SELECT id, password_hash, salt FROM users WHERE username = ?1")?;
@@ -147,6 +195,7 @@ pub fn login_user(conn: &Connection, username: &str, password: &str) -> Result<O
     Ok(None)
 }
 
+/// Derives the encryption key for a user from their password and salt.
 fn derive_key(password: &str, _salt_b64: &str) -> [u8; 32] {
     let salt = SaltString::from_b64(_salt_b64).unwrap();
     let mut key = [0u8; 32];
@@ -156,6 +205,7 @@ fn derive_key(password: &str, _salt_b64: &str) -> [u8; 32] {
     key
 }
 
+/// Adds a new journal entry for a user, with optional tags, due date, and status.
 pub fn add_entry(user: &AuthenticatedUser, content: &str, tags: Option<Vec<String>>, due: Option<String>, status: Option<String>) -> Result<()> {
     let conn = Connection::open(db_path())?;
     migrate_all(&conn)?;
@@ -182,6 +232,7 @@ pub fn add_entry(user: &AuthenticatedUser, content: &str, tags: Option<Vec<Strin
     Ok(())
 }
 
+/// Gets or creates a tag with the given name.
 fn get_or_create_tag(conn: &Connection, tag: &str) -> Result<i64> {
     let mut stmt = conn.prepare("SELECT id FROM tags WHERE name = ?1")?;
     let mut rows = stmt.query(params![tag])?;
@@ -193,6 +244,7 @@ fn get_or_create_tag(conn: &Connection, tag: &str) -> Result<i64> {
     }
 }
 
+/// Lists all journal entries for a user, optionally filtering by tag/status.
 pub fn list_entries(user: &AuthenticatedUser, tag: Option<String>, status: Option<String>) -> Result<Vec<Entry>> {
     let conn = Connection::open(db_path())?;
     migrate_all(&conn)?;
@@ -239,6 +291,7 @@ pub fn list_entries(user: &AuthenticatedUser, tag: Option<String>, status: Optio
     Ok(entries)
 }
 
+/// Lists all tags associated with an entry.
 fn list_tags_for_entry(conn: &Connection, user: &AuthenticatedUser, entry_id: i64) -> Result<Vec<String>> {
     let mut stmt = conn.prepare("SELECT t.name FROM tags t JOIN entry_tags et ON t.id = et.tag_id WHERE et.entry_id = ?1 AND et.user_id = ?2")?;
     let tag_iter = stmt.query_map(params![entry_id, user.id], |row| {
@@ -248,6 +301,7 @@ fn list_tags_for_entry(conn: &Connection, user: &AuthenticatedUser, entry_id: i6
     Ok(tag_iter.filter_map(Result::ok).collect())
 }
 
+/// Updates an existing journal entry for a user.
 pub fn update_entry(user: &AuthenticatedUser, id: i64, content: Option<String>, tags: Option<Vec<String>>, remove_tags: Option<Vec<String>>, due: Option<String>, status: Option<String>) -> Result<()> {
     let conn = Connection::open(db_path())?;
     migrate_all(&conn)?;
@@ -305,6 +359,7 @@ pub fn update_entry(user: &AuthenticatedUser, id: i64, content: Option<String>, 
     Ok(())
 }
 
+/// Gets a single journal entry by ID for a user.
 pub fn get_entry(user: &AuthenticatedUser, id: i64) -> Result<Option<Entry>> {
     let conn = Connection::open(db_path())?;
     migrate_all(&conn)?;
@@ -331,10 +386,12 @@ pub fn get_entry(user: &AuthenticatedUser, id: i64) -> Result<Option<Entry>> {
     }
 }
 
+/// Deletes a journal entry and moves it to the recycle bin.
 pub fn delete_entry(user: &AuthenticatedUser, id: i64) -> Result<()> {
     move_to_recycle_bin(user, id)
 }
 
+/// Migrates the recycle bin table.
 pub fn migrate_recycle_bin(conn: &Connection) -> Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS recycle_bin (
@@ -361,6 +418,7 @@ pub fn migrate_recycle_bin(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Migrates all tables to the latest schema.
 pub fn migrate_all(conn: &Connection) -> Result<()> {
     conn.execute("ALTER TABLE journal ADD COLUMN user_id INTEGER", []).ok();
     conn.execute("ALTER TABLE recycle_bin ADD COLUMN user_id INTEGER", []).ok();
@@ -369,6 +427,7 @@ pub fn migrate_all(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Moves an entry to the recycle bin.
 pub fn move_to_recycle_bin(user: &AuthenticatedUser, id: i64) -> Result<()> {
     let conn = Connection::open(db_path())?;
     migrate_all(&conn)?;
@@ -407,6 +466,7 @@ pub fn move_to_recycle_bin(user: &AuthenticatedUser, id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Recovers an entry from the recycle bin.
 pub fn recover_from_recycle_bin(user: &AuthenticatedUser, id: i64) -> Result<()> {
     let conn = Connection::open(db_path())?;
     migrate_all(&conn)?;
@@ -444,6 +504,7 @@ pub fn recover_from_recycle_bin(user: &AuthenticatedUser, id: i64) -> Result<()>
     Ok(())
 }
 
+/// Purges expired entries from the recycle bin.
 pub fn purge_expired_recycle_bin(user: &AuthenticatedUser) -> Result<()> {
     let conn = Connection::open(db_path())?;
     migrate_all(&conn)?;
@@ -463,6 +524,7 @@ pub fn purge_expired_recycle_bin(user: &AuthenticatedUser) -> Result<()> {
     Ok(())
 }
 
+/// Lists all entries in the recycle bin for a user.
 pub fn list_recycle_bin(user: &AuthenticatedUser) -> Result<Vec<RecycleBinEntry>> {
     let conn = Connection::open(db_path())?;
     migrate_all(&conn)?;
@@ -490,6 +552,7 @@ pub fn list_recycle_bin(user: &AuthenticatedUser) -> Result<Vec<RecycleBinEntry>
     Ok(entry_iter.filter_map(Result::ok).collect())
 }
 
+/// Cleans up legacy data in the database.
 pub fn clean_legacy_data() -> Result<()> {
     let conn = Connection::open(db_path())?;
     // Remove orphaned entries
@@ -502,6 +565,7 @@ pub fn clean_legacy_data() -> Result<()> {
     Ok(())
 }
 
+/// Changes the password for a user, re-encrypting all their data.
 pub fn change_password(user: &AuthenticatedUser, old_password: &str, new_password: &str) -> Result<()> {
     let conn = Connection::open(db_path())?;
     // Verify old password
@@ -595,6 +659,7 @@ pub fn change_password(user: &AuthenticatedUser, old_password: &str, new_passwor
     Ok(())
 }
 
+/// Initializes the audit log table.
 pub fn init_audit_log(conn: &Connection) -> Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS audit_log (
@@ -609,6 +674,7 @@ pub fn init_audit_log(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Logs an action to the audit log for a user.
 pub fn log_action(user: &AuthenticatedUser, action: &str, details: Option<&str>) -> Result<()> {
     let conn = Connection::open(db_path())?;
     migrate_all(&conn)?;
@@ -624,6 +690,7 @@ pub fn log_action(user: &AuthenticatedUser, action: &str, details: Option<&str>)
     Ok(())
 }
 
+/// Lists all audit log entries for a user.
 pub fn list_audit_log(user: &AuthenticatedUser) -> Result<Vec<AuditLog>> {
     let conn = Connection::open(db_path())?;
     migrate_all(&conn)?;
@@ -643,6 +710,7 @@ pub fn list_audit_log(user: &AuthenticatedUser) -> Result<Vec<AuditLog>> {
     Ok(log_iter.filter_map(Result::ok).collect())
 }
 
+/// Encrypts a plaintext field with the given key using AES-256-GCM.
 pub fn encrypt_field(key: &[u8; 32], plaintext: &str) -> String {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     let mut nonce_bytes = [0u8; 12];
@@ -654,8 +722,9 @@ pub fn encrypt_field(key: &[u8; 32], plaintext: &str) -> String {
     general_purpose::STANDARD.encode(&result)
 }
 
-pub fn decrypt_field(key: &[u8; 32], data: &str) -> Option<String> {
-    let decoded = general_purpose::STANDARD.decode(data).ok()?;
+/// Decrypts an encrypted field with the given key using AES-256-GCM.
+pub fn decrypt_field(key: &[u8; 32], ciphertext: &str) -> Option<String> {
+    let decoded = general_purpose::STANDARD.decode(ciphertext).ok()?;
     if decoded.len() < 12 { return None; }
     let (nonce_bytes, ciphertext) = decoded.split_at(12);
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
@@ -663,6 +732,7 @@ pub fn decrypt_field(key: &[u8; 32], data: &str) -> Option<String> {
     cipher.decrypt(nonce, ciphertext).ok().and_then(|pt| String::from_utf8(pt).ok())
 }
 
+/// Lists all tags for a user.
 pub fn list_tags(user: &AuthenticatedUser) -> Result<Vec<String>> {
     let conn = Connection::open(db_path())?;
     let mut stmt = conn.prepare("SELECT name FROM tags t JOIN entry_tags et ON t.id = et.tag_id WHERE et.user_id = ?1 GROUP BY t.id ORDER BY name COLLATE NOCASE ASC")?;
@@ -673,6 +743,7 @@ pub fn list_tags(user: &AuthenticatedUser) -> Result<Vec<String>> {
     Ok(tag_iter.filter_map(Result::ok).collect())
 }
 
+/// Lists all tags with their usage counts for a user.
 pub fn list_tags_with_counts(user: &AuthenticatedUser) -> Result<Vec<(String, u32)>> {
     let conn = Connection::open(db_path())?;
     let mut stmt = conn.prepare(
@@ -691,6 +762,7 @@ pub fn list_tags_with_counts(user: &AuthenticatedUser) -> Result<Vec<(String, u3
     Ok(tag_iter.filter_map(Result::ok).collect())
 }
 
+/// Searches for entries matching the given query.
 pub fn search_entries(user: &AuthenticatedUser, query: &str) -> Result<Vec<SearchResult>> {
     let conn = Connection::open(db_path())?;
     let mut stmt = conn.prepare(
@@ -729,6 +801,7 @@ pub fn search_entries(user: &AuthenticatedUser, query: &str) -> Result<Vec<Searc
     Ok(entry_iter.filter_map(Result::ok).collect())
 }
 
+/// Admin: Deletes all data for a user and resets their password.
 pub fn admin_reset_user(username: &str, new_password: &str) -> Result<()> {
     let conn = Connection::open(db_path())?;
     // Find user id
