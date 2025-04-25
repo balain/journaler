@@ -120,6 +120,28 @@ journaler clean-legacy
 journaler --guide
 ```
 
+## Debugging Output
+
+Journaler supports detailed debugging output for troubleshooting and development.
+
+### Enable Debug Output in the CLI
+
+Add the `--debug` flag to any command to display internal debug messages:
+
+```
+$ ./journaler --debug list
+```
+
+### Enable Debug Output in Integration Tests
+
+Set the `JOURNALER_DEBUG=1` environment variable when running tests to see debug output from test helpers and setup:
+
+```
+$ JOURNALER_DEBUG=1 cargo test -- --nocapture
+```
+
+Debug output is hidden by default and only shown when the flag or environment variable is set.
+
 ## Environment Variables
 - `JOURNAL_DB`: Set the SQLite DB path (default: `journal.db`)
 - `JOURNALER_SESSION_TIMEOUT`: Set session timeout in seconds (default: 1800)

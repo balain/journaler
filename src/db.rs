@@ -11,6 +11,8 @@ use rand::{RngCore, rngs::OsRng};
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 use aes_gcm::aead::{Aead};
 use base64::{engine::general_purpose, Engine as _};
+#[allow(unused_imports)]
+use crate::DEBUG_ENABLED;
 
 /// Entry struct represents a journal entry in the database.
 #[allow(dead_code)]
@@ -725,11 +727,26 @@ pub fn encrypt_field(key: &[u8; 32], plaintext: &str) -> String {
 /// Decrypts an encrypted field with the given key using AES-256-GCM.
 pub fn decrypt_field(key: &[u8; 32], ciphertext: &str) -> Option<String> {
     let decoded = general_purpose::STANDARD.decode(ciphertext).ok()?;
-    if decoded.len() < 12 { return None; }
+    if decoded.len() < 12 {
+        debug_println!("[DEBUG] Decrypt failed: decoded len < 12 for ciphertext: {:?}", ciphertext);
+        return None;
+    }
     let (nonce_bytes, ciphertext) = decoded.split_at(12);
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     let nonce = Nonce::from_slice(nonce_bytes);
-    cipher.decrypt(nonce, ciphertext).ok().and_then(|pt| String::from_utf8(pt).ok())
+    match cipher.decrypt(nonce, ciphertext) {
+        Ok(pt) => match String::from_utf8(pt) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                debug_println!("[DEBUG] Decrypt failed: invalid UTF-8: {}", e);
+                None
+            }
+        },
+        Err(e) => {
+            debug_println!("[DEBUG] Decrypt failed: {} for ciphertext: {:?}", e, ciphertext);
+            None
+        }
+    }
 }
 
 /// Lists all tags for a user.
@@ -759,7 +776,13 @@ pub fn list_tags_with_counts(user: &AuthenticatedUser) -> Result<Vec<(String, u3
         let count: u32 = row.get(1)?;
         Ok((decrypt_field(&user.key, &enc_tag).unwrap_or_default(), count))
     })?;
-    Ok(tag_iter.filter_map(Result::ok).collect())
+    // Aggregate counts for tags with the same name
+    let mut tag_map = std::collections::BTreeMap::new();
+    for result in tag_iter.filter_map(Result::ok) {
+        let (tag, count) = result;
+        *tag_map.entry(tag).or_insert(0) += count;
+    }
+    Ok(tag_map.into_iter().collect())
 }
 
 /// Searches for entries matching the given query.
@@ -829,4 +852,16 @@ pub fn admin_reset_user(username: &str, new_password: &str) -> Result<()> {
         params![user_id, action, details, now],
     )?;
     Ok(())
+}
+
+/// Returns true if any users exist in the database.
+pub fn users_exist(conn: &Connection) -> Result<bool> {
+    let mut stmt = conn.prepare("SELECT EXISTS(SELECT 1 FROM users LIMIT 1)")?;
+    let mut rows = stmt.query([])?;
+    if let Some(row) = rows.next()? {
+        let exists: i64 = row.get(0)?;
+        Ok(exists == 1)
+    } else {
+        Ok(false)
+    }
 }

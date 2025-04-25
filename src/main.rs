@@ -4,6 +4,9 @@
 // - Manages user authentication/session, prompts, and guides
 // - Calls db.rs for all persistent operations and encryption
 
+#[macro_use]
+mod macros;
+
 mod db;
 use clap::{Parser, Subcommand, ArgAction};
 use strsim::normalized_levenshtein;
@@ -29,7 +32,7 @@ struct UserSession {
 fn session_path() -> PathBuf {
     let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
     path.push("journaler_session.json");
-    
+    // debug_println!("Session path: {}", path.display());
     path
 }
 
@@ -81,13 +84,41 @@ fn session_timeout_secs() -> u64 {
 /// Prompts for login and creates a session if authentication succeeds.
 fn require_auth() -> db::AuthenticatedUser {
     if let Some(session) = load_session() {
+        debug_println!("Loaded session: user_id={}, username={}", session.user_id, session.username);
         return db::AuthenticatedUser { id: session.user_id, username: session.username, key: session.key };
     }
     let conn = Connection::open(db::db_path()).expect("Failed to open DB");
+    // Check for non-interactive CLI authentication
+    let username_env = std::env::var("JOURNALER_USERNAME").ok();
+    let password_env = std::env::var("JOURNALER_PASSWORD").ok();
+    if let (Some(username), Some(password)) = (username_env, password_env) {
+        match db::login_user(&conn, &username, &password) {
+            Ok(Some(user)) => {
+                debug_println!("Authenticated user: id={}, username={}", user.id, user.username);
+                save_session(&user);
+                return user;
+            },
+            _ => {
+                println!("Invalid username or password from env vars.");
+                std::process::exit(1);
+            }
+        }
+    }
+    // Check if any users exist
+    if !db::users_exist(&conn).expect("Failed to check users existence") {
+        println!("No users found. Let's create a new account.");
+        let username: String = Input::new().with_prompt("Choose a username").interact_text().unwrap();
+        let password: String = Password::new().with_prompt("Choose a password").interact().unwrap();
+        let user = db::register_user(&conn, &username, &password).expect("Failed to register user");
+        debug_println!("Registered new user: id={}, username={}", user.id, user.username);
+        save_session(&user);
+        return user;
+    }
     let username: String = Input::new().with_prompt("Username").interact_text().unwrap();
     let password: String = Password::new().with_prompt("Password").interact().unwrap();
     match db::login_user(&conn, &username, &password) {
         Ok(Some(user)) => {
+            debug_println!("Authenticated user: id={}, username={}", user.id, user.username);
             save_session(&user);
             user
         },
@@ -180,6 +211,11 @@ OPTIONS:
     --guide         Show this user guide
     --no-interactive  Do not prompt for interactive confirmations
     --session-timeout Set session timeout in seconds (default: 1800)
+    --debug         Show internal debug output for troubleshooting
+
+DEBUGGING:
+    - Use the --debug flag to show detailed debug output for CLI commands.
+    - For integration tests, set JOURNALER_DEBUG=1 to show debug logs from test helpers.
 
 SECURITY:
     - All data is encrypted per user and only accessible after authentication.
@@ -203,6 +239,7 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(cli.session_timeout);
+    unsafe { DEBUG_ENABLED = cli.debug; }
     match cli.command {
         Some(Commands::RegisterUser) => {
             let conn = Connection::open(db::db_path()).expect("Failed to open DB");
@@ -294,26 +331,39 @@ fn main() {
                 }
             }
             Commands::Tags => {
-                let tags = db::list_tags_with_counts(&user).expect("Failed to list tags");
-                if tags.is_empty() {
+                let tags_with_counts = db::list_tags_with_counts(&user).expect("Tags failed");
+                if tags_with_counts.is_empty() {
                     println!("No tags found.");
                 } else {
                     println!("Available tags:");
-                    for (t, count) in tags {
-                        println!("- {} ({})", t, count);
+                    for (tag, count) in tags_with_counts {
+                        println!("- {} ({})", tag, count);
                     }
                 }
             }
             Commands::Search { query } => {
-                let results = db::search_entries(&user, &query).expect("Search failed");
-                if results.is_empty() {
+                let entries = db::list_entries(&user, None, None).expect("List failed");
+                let q = query.to_lowercase();
+                let filtered: Vec<_> = entries.into_iter().filter(|e|
+                    e.content.to_lowercase().contains(&q)
+                    || e.status.to_lowercase().contains(&q)
+                    || e.tags.iter().any(|t| t.to_lowercase().contains(&q))
+                ).collect();
+                if filtered.is_empty() {
                     println!("No entries found matching '{}'.", query);
                 } else {
-                    println!("Results for '{}':", query);
-                    for e in results {
-                        let tags = if e.tags.is_empty() { String::new() } else { format!("[tags: {}]", e.tags.join(", ")) };
-                        let due = e.due_date.as_ref().map(|d| format!("[due: {}]", d)).unwrap_or_default();
-                        println!("{}: {} {} {} [status: {}] [created: {}] [updated: {}]", e.id, e.content, tags, due, e.status, e.created_at, e.updated_at.as_deref().unwrap_or("-"));
+                    for e in filtered {
+                        let tag_str = if !e.tags.is_empty() {
+                            format!("[tags: {}] ", e.tags.join(", "))
+                        } else { String::new() };
+                        let due_str = e.due_date.as_ref().map(|d| format!("[due: {}] ", d)).unwrap_or_default();
+                        let status_str = format!("[status: {}] ", e.status);
+                        let created_str = format!("[created: {}]", e.created_at);
+                        let updated_str = match e.updated_at {
+                            Some(ref u) => format!("[updated: {}]", u),
+                            None => String::from("[updated: -]"),
+                        };
+                        println!("{}: {} {}{}{}{} {}", e.id, e.content, tag_str, due_str, status_str, created_str, updated_str);
                     }
                 }
             }
@@ -428,6 +478,34 @@ fn main() {
                     println!("[{}] {}: {}", entry.timestamp, entry.action, entry.details.unwrap_or_default());
                 }
             }
+            Commands::List { tag, status } => {
+                let entries = db::list_entries(&user, tag.clone(), status.clone()).expect("List failed");
+                debug_println!("[DEBUG] List command: loaded {} entries from DB", entries.len());
+                for (i, e) in entries.iter().enumerate() {
+                    debug_println!("[DEBUG] Entry {}: id={}, content='{}', tags={:?}, due_date={:?}, status='{}', created_at={}, updated_at={:?}, user_id={}",
+                        i, e.id, e.content, e.tags, e.due_date, e.status, e.created_at, e.updated_at, e.user_id);
+                }
+                if entries.is_empty() {
+                    println!("No entries found.");
+                } else {
+                    for e in entries {
+                        let tags = if e.tags.is_empty() { String::new() } else { format!("[tags: {}]", e.tags.join(", ")) };
+                        let due = e.due_date.as_ref().map(|d| format!("[due: {}]", d)).unwrap_or_default();
+                        println!("{}: {} {} {} [status: {}] [created: {}] [updated: {}]", e.id, e.content, tags, due, e.status, e.created_at, e.updated_at.as_deref().unwrap_or("-"));
+                    }
+                }
+            }
+            Commands::AdminReset { username, new_password } => {
+                if !Confirm::new().with_prompt(&format!("This will delete ALL data for user '{}'. Continue?", username)).default(false).interact().unwrap() {
+                    println!("Aborted.");
+                    return;
+                }
+                match db::admin_reset_user(&username, &new_password) {
+                    Ok(_) => println!("User '{}' reset. All previous data deleted.", username),
+                    Err(e) => println!("Admin reset failed: {}", e),
+                }
+                return;
+            }
             _ => {}
         },
         None => {
@@ -439,7 +517,7 @@ fn main() {
 #[derive(Parser)]
 #[command(name = "journaler")]
 #[command(about = "A CLI journal app", long_about = None)]
-struct Cli {
+pub struct Cli {
     /// Show the user guide
     #[arg(long, action = ArgAction::SetTrue)]
     guide: bool,
@@ -450,7 +528,12 @@ struct Cli {
     session_timeout: u64,
     #[command(subcommand)]
     command: Option<Commands>,
+    /// Enable debug output
+    #[arg(long, action = ArgAction::SetTrue)]
+    debug: bool,
 }
+
+static mut DEBUG_ENABLED: bool = false;
 
 #[derive(Subcommand)]
 enum Commands {
