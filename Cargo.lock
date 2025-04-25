@@ -509,6 +509,7 @@ dependencies = [
  "clap",
  "csv",
  "dialoguer",
+ "once_cell",
  "rand",
  "rusqlite",
  "strsim",

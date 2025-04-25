@@ -227,7 +227,7 @@ fn list_tags_for_entry(conn: &Connection, user: &AuthenticatedUser, entry_id: i6
     let mut stmt = conn.prepare("SELECT t.name FROM tags t JOIN entry_tags et ON t.id = et.tag_id WHERE et.entry_id = ?1 AND et.user_id = ?2")?;
     let tag_iter = stmt.query_map(params![entry_id, user.id], |row| {
         let enc_tag: String = row.get(0)?;
-        decrypt_field(&user.key, &enc_tag).unwrap_or_default()
+        Ok(decrypt_field(&user.key, &enc_tag).unwrap_or_default())
     })?;
     Ok(tag_iter.filter_map(Result::ok).collect())
 }
@@ -239,15 +239,15 @@ pub fn update_entry(user: &AuthenticatedUser, id: i64, content: Option<String>, 
     let mut set = Vec::new();
     let mut params: Vec<Box<dyn ToSql>> = Vec::new();
     if let Some(c) = content {
-        let enc_content = encrypt_field(&user.key, c);
+        let enc_content = encrypt_field(&user.key, &c);
         set.push("content = ?"); params.push(Box::new(enc_content));
     }
     if let Some(d) = due {
-        let enc_due = encrypt_field(&user.key, d);
+        let enc_due = encrypt_field(&user.key, &d);
         set.push("due_date = ?"); params.push(Box::new(enc_due));
     }
     if let Some(s) = status {
-        let enc_status = encrypt_field(&user.key, s);
+        let enc_status = encrypt_field(&user.key, &s);
         set.push("status = ?"); params.push(Box::new(enc_status));
     }
     set.push("updated_at = ?"); params.push(Box::new(now));
@@ -598,4 +598,70 @@ pub fn decrypt_field(key: &[u8; 32], data: &str) -> Option<String> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     let nonce = Nonce::from_slice(nonce_bytes);
     cipher.decrypt(nonce, ciphertext).ok().and_then(|pt| String::from_utf8(pt).ok())
+}
+
+pub fn list_tags(user: &AuthenticatedUser) -> Result<Vec<String>> {
+    let conn = Connection::open(db_path())?;
+    let mut stmt = conn.prepare("SELECT name FROM tags t JOIN entry_tags et ON t.id = et.tag_id WHERE et.user_id = ?1 GROUP BY t.id ORDER BY name COLLATE NOCASE ASC")?;
+    let tag_iter = stmt.query_map(params![user.id], |row| {
+        let enc_tag: String = row.get(0)?;
+        Ok(decrypt_field(&user.key, &enc_tag).unwrap_or_default())
+    })?;
+    Ok(tag_iter.filter_map(Result::ok).collect())
+}
+
+pub fn list_tags_with_counts(user: &AuthenticatedUser) -> Result<Vec<(String, u32)>> {
+    let conn = Connection::open(db_path())?;
+    let mut stmt = conn.prepare(
+        "SELECT t.name, COUNT(et.entry_id) as usage_count \
+         FROM tags t \
+         JOIN entry_tags et ON t.id = et.tag_id \
+         WHERE et.user_id = ?1 \
+         GROUP BY t.id \
+         ORDER BY t.name COLLATE NOCASE ASC"
+    )?;
+    let tag_iter = stmt.query_map(params![user.id], |row| {
+        let enc_tag: String = row.get(0)?;
+        let count: u32 = row.get(1)?;
+        Ok((decrypt_field(&user.key, &enc_tag).unwrap_or_default(), count))
+    })?;
+    Ok(tag_iter.filter_map(Result::ok).collect())
+}
+
+pub fn search_entries(user: &AuthenticatedUser, query: &str) -> Result<Vec<SearchResult>> {
+    let conn = Connection::open(db_path())?;
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT j.id, j.content, j.status, j.due_date, j.created_at, j.updated_at,
+               GROUP_CONCAT(t.name, ',') as tags
+        FROM journal j
+        LEFT JOIN entry_tags et ON j.id = et.entry_id
+        LEFT JOIN tags t ON et.tag_id = t.id
+        WHERE j.user_id = ?1
+          AND (
+            j.content LIKE ?2
+            OR j.status LIKE ?2
+            OR t.name LIKE ?2
+          )
+        GROUP BY j.id
+        ORDER BY j.created_at DESC
+        "#
+    )?;
+    let like_query = format!("%{}%", query);
+    let entry_iter = stmt.query_map(params![user.id, like_query], |row| {
+        let enc_content: String = row.get(1)?;
+        let enc_status: Option<String> = row.get(2)?;
+        let enc_due: Option<String> = row.get(3)?;
+        let tags_str: Option<String> = row.get(6)?;
+        Ok(SearchResult {
+            id: row.get(0)?,
+            content: decrypt_field(&user.key, &enc_content).unwrap_or_default(),
+            status: enc_status.and_then(|s| decrypt_field(&user.key, &s)).unwrap_or_default(),
+            due_date: enc_due.and_then(|d| decrypt_field(&user.key, &d)),
+            created_at: row.get(4)?,
+            updated_at: row.get(5)?,
+            tags: tags_str.map(|s| s.split(',').filter_map(|enc| decrypt_field(&user.key, enc)).collect()).unwrap_or_default(),
+        })
+    })?;
+    Ok(entry_iter.filter_map(Result::ok).collect())
 }

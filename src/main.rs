@@ -6,6 +6,11 @@ use std::io::{self, Write};
 use csv;
 use dialoguer::{Confirm, Input, Password};
 use once_cell::sync::OnceCell;
+use rusqlite::Connection;
+
+fn db_path() -> String {
+    "journaler.db".to_string()
+}
 
 #[derive(Parser)]
 #[command(name = "journaler")]
@@ -101,7 +106,7 @@ fn require_auth() -> &'static db::AuthenticatedUser {
     if let Some(user) = AUTH_USER.get() {
         return user;
     }
-    let conn = db::Connection::open(db::db_path()).expect("Failed to open DB");
+    let conn = Connection::open(db_path()).expect("Failed to open DB");
     let username: String = Input::new().with_prompt("Username").interact_text().unwrap();
     let password: String = Password::new().with_prompt("Password").interact().unwrap();
     match db::login_user(&conn, &username, &password) {
@@ -455,7 +460,7 @@ fn main() {
                 println!("Expired entries purged from recycle bin.");
             }
             Commands::RegisterUser => {
-                let conn = db::Connection::open(db::db_path()).expect("Failed to open DB");
+                let conn = Connection::open(db_path()).expect("Failed to open DB");
                 let username: String = Input::new().with_prompt("Username").interact_text().unwrap();
                 let password: String = Password::new().with_prompt("Password").with_confirmation("Confirm password", "Passwords do not match").interact().unwrap();
                 match db::register_user(&conn, &username, &password) {
