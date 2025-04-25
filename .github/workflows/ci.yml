@@ -22,4 +22,5 @@ jobs:
           override: true
       - name: Build
         run: cargo build --release
-
+      - name: Run tests
+        run: cargo test --release
