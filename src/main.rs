@@ -4,7 +4,8 @@ use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
 use strsim::normalized_levenshtein;
 use std::io::{self, Write};
 use csv;
-use dialoguer::Confirm;
+use dialoguer::{Confirm, Input, Password};
+use once_cell::sync::OnceCell;
 
 #[derive(Parser)]
 #[command(name = "journaler")]
@@ -86,6 +87,37 @@ enum Commands {
     },
     /// Purge recycle bin (delete expired)
     PurgeRecycleBin,
+    /// Register a new user
+    RegisterUser,
+    /// Clean up legacy data
+    CleanLegacy,
+    /// Change your password
+    ChangePassword,
+}
+
+static AUTH_USER: OnceCell<db::AuthenticatedUser> = OnceCell::new();
+
+fn require_auth() -> &'static db::AuthenticatedUser {
+    if let Some(user) = AUTH_USER.get() {
+        return user;
+    }
+    let conn = db::Connection::open(db::db_path()).expect("Failed to open DB");
+    let username: String = Input::new().with_prompt("Username").interact_text().unwrap();
+    let password: String = Password::new().with_prompt("Password").interact().unwrap();
+    match db::login_user(&conn, &username, &password) {
+        Ok(Some(user)) => {
+            AUTH_USER.set(user).ok();
+            AUTH_USER.get().unwrap()
+        },
+        Ok(None) => {
+            println!("Invalid username or password.");
+            std::process::exit(1);
+        },
+        Err(e) => {
+            println!("Failed to authenticate: {}", e);
+            std::process::exit(1);
+        }
+    }
 }
 
 fn color_status(status: &str) -> String {
@@ -137,56 +169,35 @@ fn prompt_for_similar_tag(new_tag: &str, existing_tags: &[String], no_interactiv
 }
 
 fn print_help() {
-    println!(r#"journaler: Command-line Journal App
-
+    println!(r#"\
 USAGE:
     journaler <COMMAND> [OPTIONS]
 
 COMMANDS:
-    add <content> [--tags <tag> ...] [--due <date>] [--status <status>]
-        Add a new journal entry. Tags can be specified multiple times.
-    list [--tag <tag>] [--status <status>]
-        List journal entries, optionally filtered by tag or status.
-    update <id> [--content <content>] [--tags <tag> ...] [--remove-tag <tag> ...] [--due <date>] [--status <status>]
-        Update an entry. Add or remove tags, change content, due date, or status.
-    view <id>
-        View a specific entry by id.
-    tags
-        List all tags with usage counts.
-    search <query>
-        Search for entries containing the query string.
-    export [--format <format>] [--output <file>]
-        Export all entries in the chosen format (csv, md, txt) to the specified file or stdout.
-    delete <id>
-        Delete an entry by id.
-    recyclebin
-        List entries in the recycle bin.
-    recover <id>
-        Recover an entry from the recycle bin.
-    purgerecyclebin
-        Purge entries older than 30 days.
+    add             Add a new journal entry (requires authentication)
+    list            List your journal entries (requires authentication)
+    update          Update an entry (requires authentication)
+    view            View a specific entry (requires authentication)
+    delete          Delete an entry (moves to recycle bin, requires authentication)
+    tags            List your tags and usage counts (requires authentication)
+    search          Search your entries (requires authentication)
+    recycle-bin     List your recycle bin (requires authentication)
+    recover         Recover an entry from the recycle bin (requires authentication)
+    purge-recyclebin Purge entries older than 30 days from recycle bin (requires authentication)
+    register-user   Register a new user
+    clean-legacy    Remove all legacy/unowned data from the database
+    change-password Change your password and re-encrypt your data
 
 OPTIONS:
-    --guide          Show this user guide
-    -t, --tags <tag>    Specify one or more tags (can repeat)
-        --remove-tag    Remove one or more tags (can repeat)
-        --due <date>    Set or update the due date (YYYY-MM-DD or natural language)
-        --status <s>    Set or update the status label
+    --guide         Show this user guide
+    --no-interactive  Do not prompt for interactive confirmations
 
-EXAMPLES:
-    journaler add "Write a journal entry" --tags work --tags urgent --due 2025-05-01 --status "In Progress"
-    journaler list --tag work --status "Done"
-    journaler update 3 --tags project --remove-tag urgent --status Done
-    journaler tags
-    journaler search "journal entry"
-    journaler export --format csv --output entries.csv
-    journaler delete 1
-
-TIPS:
-- Tags are checked for similarity to existing tags to avoid duplicates.
-- Status can be any string (e.g., In Progress, Done, Late).
-- Dates accept YYYY-MM-DD or natural language ("tomorrow").
-- Use --guide to see this message at any time.
+SECURITY:
+    - All data is encrypted per user and only accessible after authentication.
+    - Passwords are hashed and salted using Argon2.
+    - Each user can only access their own entries, tags, and recycle bin.
+    - Password changes re-encrypt all your data with your new password.
+    - Use 'clean-legacy' to remove all data not owned by a user.
 "#);
 }
 
@@ -198,11 +209,12 @@ fn main() {
     }
     let no_interactive = cli.no_interactive;
     db::init().expect("Failed to initialize database");
+    let user = require_auth();
     match cli.command {
         Some(cmd) => match cmd {
             Commands::Add { content, tags, due, status } => {
                 let mut tags_vec = Vec::new();
-                let all_tags = db::list_tags().expect("Failed to list tags");
+                let all_tags = db::list_tags(user).expect("Failed to list tags");
                 for tag in tags {
                     if let Some(existing) = prompt_for_similar_tag(&tag, &all_tags, no_interactive) {
                         tags_vec.push(existing);
@@ -211,11 +223,11 @@ fn main() {
                     }
                 }
                 let tags_vec = if tags_vec.is_empty() { None } else { Some(tags_vec) };
-                db::add_entry(&content, tags_vec, due, status).expect("Add failed");
+                db::add_entry(user, &content, tags_vec, due, status).expect("Add failed");
                 println!("Entry added.");
             }
             Commands::List { tag, status } => {
-                let entries = db::list_entries(tag, status).expect("List failed");
+                let entries = db::list_entries(user, tag, status).expect("List failed");
                 let now = Local::now();
                 for e in entries {
                     let created_disp = {
@@ -296,7 +308,7 @@ fn main() {
             }
             Commands::Update { id, content, tags, remove_tag, due, status } => {
                 let mut tags_vec = Vec::new();
-                let all_tags = db::list_tags().expect("Failed to list tags");
+                let all_tags = db::list_tags(user).expect("Failed to list tags");
                 for tag in tags {
                     if let Some(existing) = prompt_for_similar_tag(&tag, &all_tags, no_interactive) {
                         tags_vec.push(existing);
@@ -306,18 +318,18 @@ fn main() {
                 }
                 let tags_vec = if tags_vec.is_empty() { None } else { Some(tags_vec) };
                 let remove_tags_vec = if remove_tag.is_empty() { None } else { Some(remove_tag.clone()) };
-                db::update_entry(id, content, tags_vec, remove_tags_vec, due, status).expect("Update failed");
+                db::update_entry(user, id, content, tags_vec, remove_tags_vec, due, status).expect("Update failed");
                 println!("Entry updated.");
             }
             Commands::View { id } => {
-                if let Some(e) = db::get_entry(id).expect("View failed") {
+                if let Some(e) = db::get_entry(user, id).expect("View failed") {
                     println!("{}: {} [tags: {}] [due: {:?}] [status: {}] [created: {}] [updated: {:?}]", e.id, e.content, e.tags.join(", "), e.due_date, e.status, e.created_at, e.updated_at);
                 } else {
                     println!("Entry not found.");
                 }
             }
             Commands::Tags => {
-                let tags = db::list_tags_with_counts().expect("Failed to list tags");
+                let tags = db::list_tags_with_counts(user).expect("Failed to list tags");
                 if tags.is_empty() {
                     println!("No tags found.");
                 } else {
@@ -328,7 +340,7 @@ fn main() {
                 }
             }
             Commands::Search { query } => {
-                let results = db::search_entries(&query).expect("Search failed");
+                let results = db::search_entries(user, &query).expect("Search failed");
                 if results.is_empty() {
                     println!("No entries found matching '{}'.", query);
                 } else {
@@ -341,7 +353,7 @@ fn main() {
                 }
             }
             Commands::Export { format, output } => {
-                let entries = db::list_entries(None, None).expect("Export failed");
+                let entries = db::list_entries(user, None, None).expect("Export failed");
                 let fmt = format.to_lowercase();
                 let data = match fmt.as_str() {
                     "csv" => {
@@ -404,7 +416,7 @@ fn main() {
                 }
             }
             Commands::Delete { id } => {
-                let entry = db::get_entry(id).expect("Failed to get entry");
+                let entry = db::get_entry(user, id).expect("Failed to get entry");
                 if entry.is_none() {
                     println!("Entry not found.");
                     return;
@@ -412,14 +424,14 @@ fn main() {
                 let entry = entry.unwrap();
                 println!("You are about to delete entry #{}: {}", entry.id, entry.content);
                 if cli.no_interactive || Confirm::new().with_prompt("Are you sure you want to delete this entry? It will be moved to the recycle bin for 30 days.").default(false).interact().unwrap() {
-                    db::delete_entry(id).expect("Delete failed");
+                    db::delete_entry(user, id).expect("Delete failed");
                     println!("Entry {} moved to recycle bin.", id);
                 } else {
                     println!("Aborted. Entry not deleted.");
                 }
             }
             Commands::RecycleBin => {
-                let entries = db::list_recycle_bin().expect("Failed to list recycle bin");
+                let entries = db::list_recycle_bin(user).expect("Failed to list recycle bin");
                 if entries.is_empty() {
                     println!("Recycle bin is empty.");
                 } else {
@@ -430,17 +442,39 @@ fn main() {
                 }
             }
             Commands::Recover { id } => {
-                let entries = db::list_recycle_bin().expect("Failed to list recycle bin");
+                let entries = db::list_recycle_bin(user).expect("Failed to list recycle bin");
                 if !entries.iter().any(|e| e.id == id) {
                     println!("Entry not found in recycle bin.");
                     return;
                 }
-                db::recover_from_recycle_bin(id).expect("Recover failed");
+                db::recover_from_recycle_bin(user, id).expect("Recover failed");
                 println!("Entry {} recovered from recycle bin.", id);
             }
             Commands::PurgeRecycleBin => {
-                db::purge_expired_recycle_bin().expect("Purge failed");
+                db::purge_expired_recycle_bin(user).expect("Purge failed");
                 println!("Expired entries purged from recycle bin.");
+            }
+            Commands::RegisterUser => {
+                let conn = db::Connection::open(db::db_path()).expect("Failed to open DB");
+                let username: String = Input::new().with_prompt("Username").interact_text().unwrap();
+                let password: String = Password::new().with_prompt("Password").with_confirmation("Confirm password", "Passwords do not match").interact().unwrap();
+                match db::register_user(&conn, &username, &password) {
+                    Ok(_) => println!("User '{}' registered successfully.", username),
+                    Err(e) => println!("Failed to register user: {}", e),
+                }
+            }
+            Commands::CleanLegacy => {
+                db::clean_legacy_data().expect("Failed to clean legacy data");
+                println!("Legacy data cleaned: only per-user data remains.");
+            }
+            Commands::ChangePassword => {
+                let user = require_auth();
+                let old_password: String = Password::new().with_prompt("Current password").interact().unwrap();
+                let new_password: String = Password::new().with_prompt("New password").with_confirmation("Confirm new password", "Passwords do not match").interact().unwrap();
+                match db::change_password(user, &old_password, &new_password) {
+                    Ok(_) => println!("Password changed and all your data re-encrypted."),
+                    Err(_) => println!("Password change failed. Did you enter your current password correctly?"),
+                }
             }
         },
         None => {
