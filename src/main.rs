@@ -357,7 +357,7 @@ fn main() {
                             format!("[tags: {}] ", e.tags.join(", "))
                         } else { String::new() };
                         let due_str = e.due_date.as_ref().map(|d| format!("[due: {}] ", d)).unwrap_or_default();
-                        let status_str = format!("[status: {}] ", e.status);
+                        let status_str = format!("[status: {}] ", color_status(&e.status));
                         let created_str = format!("[created: {}]", e.created_at);
                         let updated_str = match e.updated_at {
                             Some(ref u) => format!("[updated: {}]", u),
@@ -491,7 +491,13 @@ fn main() {
                     for e in entries {
                         let tags = if e.tags.is_empty() { String::new() } else { format!("[tags: {}]", e.tags.join(", ")) };
                         let due = e.due_date.as_ref().map(|d| format!("[due: {}]", d)).unwrap_or_default();
-                        println!("{}: {} {} {} [status: {}] [created: {}] [updated: {}]", e.id, e.content, tags, due, e.status, e.created_at, e.updated_at.as_deref().unwrap_or("-"));
+                        let status_str = format!("[status: {}] ", color_status(&e.status));
+                        let created_str = format!("[created: {}]", e.created_at);
+                        let updated_str = match e.updated_at {
+                            Some(ref u) => format!("[updated: {}]", u),
+                            None => String::from("[updated: -]"),
+                        };
+                        println!("{}: {} {}{}{}{} {}", e.id, e.content, tags, due, status_str, created_str, updated_str);
                     }
                 }
             }
