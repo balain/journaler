@@ -46,7 +46,7 @@ pub struct AuthenticatedUser {
     pub key: [u8; 32], // AES-256 key
 }
 
-fn db_path() -> String {
+pub fn db_path() -> String {
     env::var("JOURNAL_DB").unwrap_or_else(|_| "journal.db".to_string())
 }
 
@@ -103,6 +103,7 @@ pub fn create_users_table(conn: &Connection) -> Result<()> {
 }
 
 pub fn register_user(conn: &Connection, username: &str, password: &str) -> Result<AuthenticatedUser> {
+    init()?; // Ensure all tables exist
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = Argon2::default();
     let hash = argon2.hash_password(password.as_bytes(), &salt).unwrap().to_string();
@@ -117,6 +118,7 @@ pub fn register_user(conn: &Connection, username: &str, password: &str) -> Resul
 }
 
 pub fn login_user(conn: &Connection, username: &str, password: &str) -> Result<Option<AuthenticatedUser>> {
+    init()?; // Ensure all tables exist
     let mut stmt = conn.prepare("SELECT id, password_hash, salt FROM users WHERE username = ?1")?;
     let mut rows = stmt.query(params![username])?;
     if let Some(row) = rows.next()? {

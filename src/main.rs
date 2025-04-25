@@ -5,11 +5,65 @@ use strsim::normalized_levenshtein;
 use std::io::{self, Write};
 use csv;
 use dialoguer::{Confirm, Input, Password};
-use once_cell::sync::OnceCell;
 use rusqlite::Connection;
+use std::fs;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
+use serde::{Serialize, Deserialize};
+use dirs;
 
-fn db_path() -> String {
-    "journaler.db".to_string()
+#[derive(Serialize, Deserialize)]
+struct UserSession {
+    user_id: i64,
+    username: String,
+    key: [u8; 32],
+    last_active: u64, // unix timestamp (seconds)
+}
+
+fn session_path() -> PathBuf {
+    let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+    path.push("journaler_session.json");
+    path
+}
+
+fn now_ts() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+}
+
+fn session_timeout_secs() -> u64 {
+    std::env::var("JOURNALER_SESSION_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1800)
+}
+
+fn load_session() -> Option<UserSession> {
+    let path = session_path();
+    if let Ok(data) = fs::read_to_string(&path) {
+        if let Ok(mut session) = serde_json::from_str::<UserSession>(&data) {
+            let now = now_ts();
+            if now - session.last_active <= session_timeout_secs() {
+                session.last_active = now;
+                let _ = fs::write(&path, serde_json::to_string(&session).unwrap());
+                return Some(session);
+            }
+        }
+    }
+    None
+}
+
+fn save_session(user: &db::AuthenticatedUser) {
+    let session = UserSession {
+        user_id: user.id,
+        username: user.username.clone(),
+        key: user.key,
+        last_active: now_ts(),
+    };
+    let _ = fs::write(session_path(), serde_json::to_string(&session).unwrap());
+}
+
+fn clear_session() {
+    let _ = fs::remove_file(session_path());
 }
 
 #[derive(Parser)]
@@ -22,6 +76,8 @@ struct Cli {
     /// Disable interactive prompts (for automated tests)
     #[arg(long, hide = true, action = ArgAction::SetTrue)]
     no_interactive: bool,
+    #[arg(long, env = "JOURNALER_SESSION_TIMEOUT", default_value_t = 1800)]
+    session_timeout: u64,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -98,21 +154,21 @@ enum Commands {
     CleanLegacy,
     /// Change your password
     ChangePassword,
+    /// Log out and clear your session
+    Logout,
 }
 
-static AUTH_USER: OnceCell<db::AuthenticatedUser> = OnceCell::new();
-
-fn require_auth() -> &'static db::AuthenticatedUser {
-    if let Some(user) = AUTH_USER.get() {
-        return user;
+fn require_auth() -> db::AuthenticatedUser {
+    if let Some(session) = load_session() {
+        return db::AuthenticatedUser { id: session.user_id, username: session.username, key: session.key };
     }
-    let conn = Connection::open(db_path()).expect("Failed to open DB");
+    let conn = Connection::open(db::db_path()).expect("Failed to open DB");
     let username: String = Input::new().with_prompt("Username").interact_text().unwrap();
     let password: String = Password::new().with_prompt("Password").interact().unwrap();
     match db::login_user(&conn, &username, &password) {
         Ok(Some(user)) => {
-            AUTH_USER.set(user).ok();
-            AUTH_USER.get().unwrap()
+            save_session(&user);
+            user
         },
         Ok(None) => {
             println!("Invalid username or password.");
@@ -192,10 +248,12 @@ COMMANDS:
     register-user   Register a new user
     clean-legacy    Remove all legacy/unowned data from the database
     change-password Change your password and re-encrypt your data
+    logout          Log out and clear your session
 
 OPTIONS:
     --guide         Show this user guide
     --no-interactive  Do not prompt for interactive confirmations
+    --session-timeout Set session timeout in seconds (default: 1800)
 
 SECURITY:
     - All data is encrypted per user and only accessible after authentication.
@@ -207,13 +265,46 @@ SECURITY:
 }
 
 fn main() {
+    db::init().expect("Failed to initialize database");
     let cli = Cli::parse();
     if cli.guide {
         print_help();
         return;
     }
     let no_interactive = cli.no_interactive;
-    db::init().expect("Failed to initialize database");
+    match cli.command {
+        Some(Commands::RegisterUser) => {
+            let conn = Connection::open(db::db_path()).expect("Failed to open DB");
+            let username: String = Input::new().with_prompt("Username").interact_text().unwrap();
+            let password: String = Password::new().with_prompt("Password").with_confirmation("Confirm password", "Passwords do not match").interact().unwrap();
+            match db::register_user(&conn, &username, &password) {
+                Ok(_) => println!("User '{}' registered successfully.", username),
+                Err(e) => println!("Failed to register user: {}", e),
+            }
+            return;
+        }
+        Some(Commands::CleanLegacy) => {
+            db::clean_legacy_data().expect("Failed to clean legacy data");
+            println!("Legacy data cleaned: only per-user data remains.");
+            return;
+        }
+        Some(Commands::ChangePassword) => {
+            let user = require_auth();
+            let old_password: String = Password::new().with_prompt("Current password").interact().unwrap();
+            let new_password: String = Password::new().with_prompt("New password").with_confirmation("Confirm new password", "Passwords do not match").interact().unwrap();
+            match db::change_password(user, &old_password, &new_password) {
+                Ok(_) => println!("Password changed and all your data re-encrypted."),
+                Err(_) => println!("Password change failed. Did you enter your current password correctly?"),
+            }
+            return;
+        }
+        Some(Commands::Logout) => {
+            clear_session();
+            println!("Logged out. Session cleared.");
+            return;
+        }
+        _ => {}
+    }
     let user = require_auth();
     match cli.command {
         Some(cmd) => match cmd {
@@ -459,28 +550,7 @@ fn main() {
                 db::purge_expired_recycle_bin(user).expect("Purge failed");
                 println!("Expired entries purged from recycle bin.");
             }
-            Commands::RegisterUser => {
-                let conn = Connection::open(db_path()).expect("Failed to open DB");
-                let username: String = Input::new().with_prompt("Username").interact_text().unwrap();
-                let password: String = Password::new().with_prompt("Password").with_confirmation("Confirm password", "Passwords do not match").interact().unwrap();
-                match db::register_user(&conn, &username, &password) {
-                    Ok(_) => println!("User '{}' registered successfully.", username),
-                    Err(e) => println!("Failed to register user: {}", e),
-                }
-            }
-            Commands::CleanLegacy => {
-                db::clean_legacy_data().expect("Failed to clean legacy data");
-                println!("Legacy data cleaned: only per-user data remains.");
-            }
-            Commands::ChangePassword => {
-                let user = require_auth();
-                let old_password: String = Password::new().with_prompt("Current password").interact().unwrap();
-                let new_password: String = Password::new().with_prompt("New password").with_confirmation("Confirm new password", "Passwords do not match").interact().unwrap();
-                match db::change_password(user, &old_password, &new_password) {
-                    Ok(_) => println!("Password changed and all your data re-encrypted."),
-                    Err(_) => println!("Password change failed. Did you enter your current password correctly?"),
-                }
-            }
+            _ => {}
         },
         None => {
             print_help();
